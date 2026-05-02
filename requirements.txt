@@ -1,0 +1,17 @@
+Flask
+Flask-Cors
+pandas
+numpy
+numba
+ccxt
+yfinance
+google-genai
+firebase-admin
+requests
+scipy
+plotly
+streamlit
+fpdf
+python-dotenv
+pandas-ta
+google-generativeai

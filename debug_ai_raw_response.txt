@@ -1,0 +1,29 @@
+```json
+{
+    "macro_analysis": {
+        "trend": "Bullish",
+        "detailed_breakdown": "The macro structure has transitioned from a long-term Bearish Impulse into a significant bullish reversal. After hitting a macro low of 0.0919, APEUSDT rallied aggressively to 0.2780. Currently, the price is holding above the 1D and 4H EMA clusters, suggesting the larger trend has shifted to bullish, with the current price action representing a corrective phase of the recent impulse.",
+        "key_levels": "Major Resistance: 0.1917, 0.2780. Major Support: 0.1557, 0.1207 (EMA200)."
+    },
+    "micro_analysis": {
+        "wave_count_status": "Price recently completed a corrective sequence near 0.1411 and is currently in a vertical recovery wave.",
+        "wave_personality": "Impulsive but overextended near resistance."
+    },
+    "action_advice": "No chase. Price is hitting a Strength 3 resistance zone (0.1839). Wait for a clear breakout above 0.1917 or a pullback to structural support.",
+    "trade_scenarios": [
+        {
+            "name": "Sniper Setup",
+            "trade_type": "WAIT",
+            "probability": "Low",
+            "summary": "The trade is currently 'trapped' between heavy resistance and deep structural support. According to the structural invalidation rules, the stop loss must be placed below the Major Support Zone (0.1557) with an ATR buffer, leading to an invalidation price near 0.1477. With the immediate Major Resistance Zone (0.1829 - 0.1848) and the Long Lookback Resistance (0.1917) being relatively close to the current price, the setup fails the 2.0R Risk/Reward requirement for TP2. Entering at current levels would be 'buying the top' of the local range into a Strength 3 resistance barrier.",
+            "entry_zone": "0.1813",
+            "targets": [
+                "0.2317",
+                "0.2780"
+            ],
+            "invalidation": "0.1477"
+        }
+    ]
+}
+
+```
