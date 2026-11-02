@@ -117,7 +117,7 @@ class MonoWaveUp(MonoWave):
             if act_high > high:
                 high = act_high
                 high_idx = act_high_idx
-                if np.min(self.lows_arr[self.idx_start:act_high_idx] < low_at_start):
+                if np.any(self.lows_arr[self.idx_start:act_high_idx] < low_at_start):
                     return None, None
 
         return high, high_idx

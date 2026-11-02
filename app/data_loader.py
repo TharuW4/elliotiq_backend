@@ -2,6 +2,32 @@ import ccxt
 import pandas as pd
 import yfinance as yf
 import time
+import threading
+
+
+_CRYPTO_EXCHANGE_LOCAL = threading.local()
+
+
+def _get_binance_futures_exchange():
+    exchange = getattr(
+        _CRYPTO_EXCHANGE_LOCAL,
+        "binance_futures",
+        None,
+    )
+
+    if exchange is None:
+        exchange = ccxt.binance({
+            "enableRateLimit": True,
+            "timeout": 30000,
+            "options": {
+                "defaultType": "future",
+            },
+        })
+
+        _CRYPTO_EXCHANGE_LOCAL.binance_futures = exchange
+
+    return exchange
+
 
 def get_data(symbol, interval, limit=1000, period=None, market_type="crypto"):
     """
@@ -110,13 +136,11 @@ def get_data(symbol, interval, limit=1000, period=None, market_type="crypto"):
     # --- 2. CRYPTO LOGIC (BINANCE - CCXT) ---
     # ==========================================
     else:
-        print(f"--- [DEBUG] Connecting to Binance for {symbol} ({interval}) ---")
+        print(f"--- [DEBUG] Connecting to Binance USD-M Futures for {symbol} ({interval}) ---")
         try:
-            exchange = ccxt.binance({
-                'enableRateLimit': True,
-                'timeout': 30000,
-            })
+            exchange = _get_binance_futures_exchange()
             
+            print(f"--- [DEBUG] CCXT defaultType: {exchange.options.get('defaultType')} ---")
             # exchange.options['defaultType'] = 'future' # Optional: Enable for Futures data
 
             # Binance/CCXT uses "1M" for monthly candles, while the UI/map may pass "1mo".
@@ -149,3 +173,47 @@ def get_data(symbol, interval, limit=1000, period=None, market_type="crypto"):
             print(f"Error Message: {str(e)}")
             print("="*40 + "\n")
             return pd.DataFrame()
+
+def get_mtf_data(symbol, base_tf, market_type="crypto"):
+    """
+    Fetches Multi-Timeframe (MTF) Data based on the user's requested timeframe.
+    Returns a dictionary of DataFrames:
+    - Target TF (What user asked for)
+    - Confirm TF (One level higher)
+    - Macro TF (Two levels higher)
+    """
+    print(f"\n--- [DEBUG] Fetching MTF Data for {symbol} ({base_tf} Base) ---")
+    
+    # 1. Define the MTF Hierarchy
+    tf_hierarchy = {
+        "15m": ["15m", "1h", "4h"],   # Day Trading
+        "1h":  ["1h", "4h", "1d"],    # Short-term Swing
+        "4h":  ["4h", "1d", "1w"]     # Macro Swing
+    }
+    
+    # If the user asks for a TF not in our hierarchy, default to fetching just that one
+    tf_list = tf_hierarchy.get(base_tf, [base_tf])
+    
+    # 2. Fetch data for all required timeframes
+    mtf_data = {}
+    for tf in tf_list:
+        print(f"-> Fetching {tf} data...")
+        df = get_data(symbol=symbol, interval=tf, market_type=market_type)
+        if df.empty:
+            print(f"-> [WARNING] Empty data returned for {tf}. MTF Context might be incomplete.")
+        mtf_data[tf] = df
+        time.sleep(1) # Small pause to avoid rate limits (especially for Binance)
+
+    # 3. Organize and return the payload
+    # We always return 'target', 'confirm', and 'macro' keys so AI engine knows what to look for.
+    payload = {
+        "target": mtf_data.get(tf_list[0], pd.DataFrame()),
+        "confirm": mtf_data.get(tf_list[1], pd.DataFrame()) if len(tf_list) > 1 else pd.DataFrame(),
+        "macro": mtf_data.get(tf_list[2], pd.DataFrame()) if len(tf_list) > 2 else pd.DataFrame(),
+        "target_tf": tf_list[0],
+        "confirm_tf": tf_list[1] if len(tf_list) > 1 else None,
+        "macro_tf": tf_list[2] if len(tf_list) > 2 else None
+    }
+    
+    print("--- [SUCCESS] MTF Data Fetch Complete ---\n")
+    return payload

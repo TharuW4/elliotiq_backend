@@ -241,6 +241,24 @@ def audit_open_trade(
 
         # Create new audit trade
         trade_id = make_trade_id(clean_symbol, timeframe)
+        opened_at_iso = utc_now_iso()
+
+        order_type = str(
+            scenario.get("order_type")
+            or ""
+        ).upper().strip()
+
+        scenario_status = str(
+            scenario.get("status")
+            or ""
+        ).upper().strip()
+
+        entry_triggered_at_creation = bool(
+            scenario.get("entry_filled_at_creation")
+            or scenario.get("entry_filled")
+            or order_type == "MARKET"
+            or "RUNNING" in scenario_status
+        )
 
         trade_data = {
             "trade_id": trade_id,
@@ -261,11 +279,24 @@ def audit_open_trade(
             "stop_loss": float(stop_loss),
             "targets": [float(t) for t in targets],
 
+            "entry_triggered": entry_triggered_at_creation,
+            "entry_triggered_at_iso": (
+                opened_at_iso
+                if entry_triggered_at_creation
+                else None
+            ),
+
+            "tp1_hit": False,
+            "tp1_hit_price": None,
+            "tp1_hit_at_iso": None,
+            "highest_target_hit": 0,
+            "win_type": None,
+
             "scenario": json_safe(scenario),
             "latest_scenario": json_safe(scenario),
 
             "opened_at": firestore.SERVER_TIMESTAMP,
-            "opened_at_iso": utc_now_iso(),
+            "opened_at_iso": opened_at_iso,
 
             "closed_at": None,
             "closed_at_iso": None,
@@ -274,7 +305,7 @@ def audit_open_trade(
             "close_price": None,
 
             "updated_at": firestore.SERVER_TIMESTAMP,
-            "updated_at_iso": utc_now_iso(),
+            "updated_at_iso": opened_at_iso,
         }
 
         db.collection(TRADE_AUDIT_COLLECTION).document(trade_id).set(trade_data)
@@ -311,10 +342,10 @@ def audit_close_trade(
     """
     Close active audit trade as WON / LOST / CANCELLED.
 
-    result:
-    - WON
-    - LOST
-    - CANCELLED
+    Policy:
+    - SL before TP1 -> LOST
+    - TP1 secured, then runner hits SL -> WON / TP1_PARTIAL
+    - TP2 hit -> WON / TP2_FULL
     """
 
     try:
@@ -329,7 +360,11 @@ def audit_close_trade(
         if result not in ["WON", "LOST", "CANCELLED"]:
             return False, f"Invalid result: {result}"
 
-        active_ref = db.collection(TRADE_AUDIT_ACTIVE_INDEX).document(active_key)
+        active_ref = (
+            db.collection(TRADE_AUDIT_ACTIVE_INDEX)
+            .document(active_key)
+        )
+
         active_doc = active_ref.get()
 
         if not active_doc.exists:
@@ -341,13 +376,90 @@ def audit_close_trade(
         if not trade_id:
             return False, "Active index has no trade_id"
 
-        trade_ref = db.collection(TRADE_AUDIT_COLLECTION).document(trade_id)
+        trade_ref = (
+            db.collection(TRADE_AUDIT_COLLECTION)
+            .document(trade_id)
+        )
+
+        trade_doc = trade_ref.get()
+
+        trade_data = (
+            trade_doc.to_dict()
+            if trade_doc.exists
+            else {}
+        )
+
+        trade_data = trade_data or {}
+
+        stored_tp1_hit = bool(
+            trade_data.get("tp1_hit")
+        )
+
+        reason_text = str(
+            reason or ""
+        ).strip()
+
+        reason_upper = reason_text.upper()
+        win_type = None
+
+        # Once TP1 was secured on an earlier candle,
+        # a later runner stop is a partial win.
+        if result == "LOST" and stored_tp1_hit:
+            result = "WON"
+            win_type = "TP1_PARTIAL"
+
+            stored_stop = extract_price(
+                trade_data.get("stop_loss")
+            )
+
+            if stored_stop is not None:
+                close_price = stored_stop
+
+            reason_text = (
+                "TP1 was secured earlier; the remaining "
+                "runner later hit Stop Loss. "
+                + reason_text
+            ).strip()
+
+        elif result == "WON":
+            # A normal WON result means TP2/full target was reached.
+            # Classify as partial only when the reason explicitly says
+            # TP1 was secured and the remaining runner hit SL/Stop Loss.
+            tp1_runner_stopped = bool(
+                "TP1" in reason_upper
+                and (
+                    "STOP" in reason_upper
+                    or "SL" in reason_upper
+                )
+            )
+
+            win_type = (
+                "TP1_PARTIAL"
+                if tp1_runner_stopped
+                else "TP2_FULL"
+            )
 
         close_payload = {
             "status": "CLOSED",
             "result": result,
-            "close_reason": reason,
-            "close_price": float(close_price) if close_price is not None else None,
+            "win_type": win_type,
+
+            "close_reason": reason_text,
+
+            "close_price": (
+                float(close_price)
+                if close_price is not None
+                else None
+            ),
+
+            "tp1_hit": bool(
+                stored_tp1_hit
+                or win_type
+                in [
+                    "TP1_PARTIAL",
+                    "TP2_FULL",
+                ]
+            ),
 
             "closed_at": firestore.SERVER_TIMESTAMP,
             "closed_at_iso": utc_now_iso(),
@@ -356,15 +468,23 @@ def audit_close_trade(
             "updated_at_iso": utc_now_iso(),
         }
 
-        trade_ref.set(close_payload, merge=True)
+        trade_ref.set(
+            close_payload,
+            merge=True,
+        )
 
-        # Remove active index only. History remains.
+        # Remove active index only.
+        # Trade history remains.
         active_ref.delete()
 
         return True, trade_id
 
     except Exception as e:
-        print(f"[TRADE_AUDIT] audit_close_trade error: {e}")
+        print(
+            f"[TRADE_AUDIT] "
+            f"audit_close_trade error: {e}"
+        )
+
         return False, str(e)
 
 
@@ -693,176 +813,443 @@ def _symbol_for_data_loader(symbol: str) -> str:
     return normalize_symbol(symbol)
 
 
-def _check_audit_trade_result_from_candles(trade: Dict[str, Any], df) -> Dict[str, Any]:
+def _check_audit_trade_result_from_candles(
+    trade: Dict[str, Any],
+    df,
+) -> Dict[str, Any]:
     """
     Check one OPEN audit trade using candle High/Low.
 
     Conservative rule:
     - Entry must trigger first.
-    - If SL and TP hit in same candle, SL is counted first.
-    - If TP2 exists, TP2 = WON.
-    - If only TP1 exists, TP1 = WON.
+    - If SL and a target hit in the same candle,
+      SL is counted first.
+    - TP1 keeps the audit OPEN.
+    - TP1 on an earlier candle, then SL later
+      = WON / TP1_PARTIAL.
+    - TP2 = WON / TP2_FULL.
     """
+
+    def make_result(
+        status="OPEN",
+        result=None,
+        reason="",
+        close_price=None,
+        win_type=None,
+    ):
+        return {
+            "status": status,
+            "result": result,
+            "win_type": win_type,
+            "reason": reason,
+            "close_price": close_price,
+
+            "entry_triggered": entry_triggered,
+            "entry_triggered_at_iso": (
+                entry_triggered_at_iso
+            ),
+
+            "tp1_hit": tp1_hit,
+            "tp1_hit_price": tp1_hit_price,
+            "tp1_hit_at_iso": tp1_hit_at_iso,
+
+            "highest_target_hit": (
+                highest_target_hit
+            ),
+        }
+
+    entry_triggered = bool(
+        trade.get("entry_triggered")
+    )
+
+    entry_triggered_at_iso = trade.get(
+        "entry_triggered_at_iso"
+    )
+
+    tp1_hit = bool(
+        trade.get("tp1_hit")
+    )
+
+    tp1_hit_price = extract_price(
+        trade.get("tp1_hit_price")
+    )
+
+    tp1_hit_at_iso = trade.get(
+        "tp1_hit_at_iso"
+    )
+
+    try:
+        highest_target_hit = int(
+            trade.get("highest_target_hit")
+            or 0
+        )
+    except Exception:
+        highest_target_hit = 0
+
+    if tp1_hit:
+        highest_target_hit = max(
+            highest_target_hit,
+            1,
+        )
 
     try:
         if df is None or df.empty:
-            return {
-                "status": "OPEN",
-                "result": None,
-                "reason": "No candle data",
-                "close_price": None,
-            }
+            return make_result(
+                reason="No candle data"
+            )
 
-        side = str(trade.get("side") or trade.get("trade_type", "")).upper()
+        side = str(
+            trade.get("side")
+            or trade.get("trade_type", "")
+        ).upper()
 
         if "LONG" in side:
             side = "LONG"
+
         elif "SHORT" in side:
             side = "SHORT"
-        else:
-            return {
-                "status": "OPEN",
-                "result": None,
-                "reason": "Unknown trade side",
-                "close_price": None,
-            }
 
-        entry = float(trade["entry"])
-        stop_loss = float(trade["stop_loss"])
-        targets = [float(x) for x in trade.get("targets", [])]
+        else:
+            return make_result(
+                reason="Unknown trade side"
+            )
+
+        entry = float(
+            trade["entry"]
+        )
+
+        stop_loss = float(
+            trade["stop_loss"]
+        )
+
+        targets = [
+            float(x)
+            for x in trade.get("targets", [])
+        ]
 
         if not targets:
-            return {
-                "status": "OPEN",
-                "result": None,
-                "reason": "No targets",
-                "close_price": None,
-            }
+            return make_result(
+                reason="No targets"
+            )
 
         if side == "LONG":
             targets = sorted(targets)
         else:
-            targets = sorted(targets, reverse=True)
+            targets = sorted(
+                targets,
+                reverse=True,
+            )
 
-        # TP2 = full win if available.
-        # TP1 = partial win / TP1_HIT if TP2 is not hit yet.
-        required_tp_index = 1 if len(targets) >= 2 else 0
-        highest_tp_hit_index = -1
-        entry_triggered = False
+        tp1 = targets[0]
 
-        opened_at_iso = trade.get("opened_at_iso")
+        tp2 = (
+            targets[1]
+            if len(targets) > 1
+            else None
+        )
 
-        # Make sure index is datetime
+        opened_at_iso = trade.get(
+            "opened_at_iso"
+        )
+
         try:
             import pandas as pd
 
             if "Date" in df.columns:
                 df = df.copy()
-                df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+
+                df["Date"] = pd.to_datetime(
+                    df["Date"],
+                    utc=True,
+                    errors="coerce",
+                )
+
                 df = df.set_index("Date")
 
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+            if not isinstance(
+                df.index,
+                pd.DatetimeIndex,
+            ):
+                df = df.copy()
+
+                df.index = pd.to_datetime(
+                    df.index,
+                    utc=True,
+                    errors="coerce",
+                )
+
+            df = df[
+                ~df.index.isna()
+            ]
 
             if opened_at_iso:
-                opened_dt = pd.to_datetime(opened_at_iso, utc=True, errors="coerce")
-                df = df[df.index >= opened_dt]
+                opened_dt = pd.to_datetime(
+                    opened_at_iso,
+                    utc=True,
+                    errors="coerce",
+                )
+
+                if not pd.isna(opened_dt):
+                    df = df[
+                        df.index >= opened_dt
+                    ]
+
         except Exception:
             pass
 
         if df.empty:
-            return {
-                "status": "OPEN",
-                "result": None,
-                "reason": "No candles after signal open time",
-                "close_price": None,
-            }
+            return make_result(
+                reason=(
+                    "No candles after "
+                    "signal open time"
+                )
+            )
 
         for row in df.itertuples():
-            curr_low = float(row.Low)
-            curr_high = float(row.High)
+            curr_low = float(
+                row.Low
+            )
+
+            curr_high = float(
+                row.High
+            )
+
+            candle_time_iso = None
+
+            try:
+                candle_time = getattr(
+                    row,
+                    "Index",
+                    None,
+                )
+
+                if candle_time is not None:
+                    candle_time_iso = (
+                        candle_time.isoformat()
+                    )
+
+            except Exception:
+                pass
+
+            # ------------------------------------------
+            # Entry trigger
+            # ------------------------------------------
+            if not entry_triggered:
+                if (
+                    side == "LONG"
+                    and curr_low <= entry
+                ):
+                    entry_triggered = True
+                    entry_triggered_at_iso = (
+                        candle_time_iso
+                    )
+
+                elif (
+                    side == "SHORT"
+                    and curr_high >= entry
+                ):
+                    entry_triggered = True
+                    entry_triggered_at_iso = (
+                        candle_time_iso
+                    )
 
             if not entry_triggered:
-                if side == "LONG" and curr_low <= entry:
-                    entry_triggered = True
-                elif side == "SHORT" and curr_high >= entry:
-                    entry_triggered = True
+                continue
 
-            if entry_triggered:
-                if side == "LONG":
-                    # Conservative: SL first if same candle touches both
-                    if curr_low <= stop_loss:
-                        return {
-                            "status": "CLOSED",
-                            "result": "LOST",
-                            "reason": "Stop Loss Hit",
-                            "close_price": stop_loss,
-                        }
+            # ==========================================
+            # LONG
+            # ==========================================
+            if side == "LONG":
 
-                    for i, tp in enumerate(targets):
-                        if curr_high >= tp and i > highest_tp_hit_index:
-                            highest_tp_hit_index = i
+                # Conservative same-candle ordering:
+                # Stop Loss is checked before targets.
+                if curr_low <= stop_loss:
+                    if tp1_hit:
+                        return make_result(
+                            status="CLOSED",
+                            result="WON",
+                            win_type=(
+                                "TP1_PARTIAL"
+                            ),
+                            reason=(
+                                "TP1 was secured earlier; "
+                                "the remaining runner later "
+                                "hit Stop Loss."
+                            ),
+                            close_price=stop_loss,
+                        )
 
-                elif side == "SHORT":
-                    # Conservative: SL first if same candle touches both
-                    if curr_high >= stop_loss:
-                        return {
-                            "status": "CLOSED",
-                            "result": "LOST",
-                            "reason": "Stop Loss Hit",
-                            "close_price": stop_loss,
-                        }
+                    return make_result(
+                        status="CLOSED",
+                        result="LOST",
+                        reason=(
+                            "Stop Loss Hit before TP1"
+                        ),
+                        close_price=stop_loss,
+                    )
 
-                    for i, tp in enumerate(targets):
-                        if curr_low <= tp and i > highest_tp_hit_index:
-                            highest_tp_hit_index = i
+                # TP2 full win
+                if (
+                    tp2 is not None
+                    and curr_high >= tp2
+                ):
+                    tp1_hit = True
+                    tp1_hit_price = tp1
 
-                # TP2 hit = full WON.
-                # TP1 hit only = close as TP1_HIT, not WON.
-                if highest_tp_hit_index >= required_tp_index:
-                    return {
-                        "status": "CLOSED",
-                        "result": "WON",
-                        "reason": f"Target {highest_tp_hit_index + 1} Hit",
-                        "close_price": targets[highest_tp_hit_index],
-                    }
+                    tp1_hit_at_iso = (
+                        tp1_hit_at_iso
+                        or candle_time_iso
+                    )
 
-                if highest_tp_hit_index == 0 and len(targets) > 1:
-                    return {
-                        "status": "CLOSED",
-                        "result": "TP1_HIT",
-                        "reason": "Target 1 Hit",
-                        "close_price": targets[0],
-                    }
+                    highest_target_hit = 2
 
-        last_close = None
+                    return make_result(
+                        status="CLOSED",
+                        result="WON",
+                        win_type="TP2_FULL",
+                        reason="Target 2 Hit",
+                        close_price=tp2,
+                    )
+
+                # TP1 reached.
+                # Keep audit OPEN.
+                if (
+                    curr_high >= tp1
+                    and not tp1_hit
+                ):
+                    tp1_hit = True
+                    tp1_hit_price = tp1
+                    tp1_hit_at_iso = (
+                        candle_time_iso
+                    )
+                    highest_target_hit = 1
+
+                # Only one target configured
+                if (
+                    tp2 is None
+                    and curr_high >= tp1
+                ):
+                    return make_result(
+                        status="CLOSED",
+                        result="WON",
+                        win_type="TP1_ONLY",
+                        reason=(
+                            "Only configured target hit"
+                        ),
+                        close_price=tp1,
+                    )
+
+            # ==========================================
+            # SHORT
+            # ==========================================
+            else:
+
+                # Conservative same-candle ordering:
+                # Stop Loss is checked before targets.
+                if curr_high >= stop_loss:
+                    if tp1_hit:
+                        return make_result(
+                            status="CLOSED",
+                            result="WON",
+                            win_type=(
+                                "TP1_PARTIAL"
+                            ),
+                            reason=(
+                                "TP1 was secured earlier; "
+                                "the remaining runner later "
+                                "hit Stop Loss."
+                            ),
+                            close_price=stop_loss,
+                        )
+
+                    return make_result(
+                        status="CLOSED",
+                        result="LOST",
+                        reason=(
+                            "Stop Loss Hit before TP1"
+                        ),
+                        close_price=stop_loss,
+                    )
+
+                # TP2 full win
+                if (
+                    tp2 is not None
+                    and curr_low <= tp2
+                ):
+                    tp1_hit = True
+                    tp1_hit_price = tp1
+
+                    tp1_hit_at_iso = (
+                        tp1_hit_at_iso
+                        or candle_time_iso
+                    )
+
+                    highest_target_hit = 2
+
+                    return make_result(
+                        status="CLOSED",
+                        result="WON",
+                        win_type="TP2_FULL",
+                        reason="Target 2 Hit",
+                        close_price=tp2,
+                    )
+
+                # TP1 reached.
+                # Keep audit OPEN.
+                if (
+                    curr_low <= tp1
+                    and not tp1_hit
+                ):
+                    tp1_hit = True
+                    tp1_hit_price = tp1
+                    tp1_hit_at_iso = (
+                        candle_time_iso
+                    )
+                    highest_target_hit = 1
+
+                # Only one target configured
+                if (
+                    tp2 is None
+                    and curr_low <= tp1
+                ):
+                    return make_result(
+                        status="CLOSED",
+                        result="WON",
+                        win_type="TP1_ONLY",
+                        reason=(
+                            "Only configured target hit"
+                        ),
+                        close_price=tp1,
+                    )
+
         try:
-            last_close = float(df.iloc[-1]["Close"])
+            last_close = float(
+                df.iloc[-1]["Close"]
+            )
         except Exception:
-            pass
+            last_close = None
 
-        if entry_triggered:
-            return {
-                "status": "OPEN",
-                "result": None,
-                "reason": "Trade running",
-                "close_price": last_close,
-            }
+        if entry_triggered and tp1_hit:
+            reason = (
+                "TP1 secured; runner remains open "
+                "for TP2 or protective stop."
+            )
 
-        return {
-            "status": "OPEN",
-            "result": None,
-            "reason": "Waiting for entry",
-            "close_price": last_close,
-        }
+        elif entry_triggered:
+            reason = "Trade running"
+
+        else:
+            reason = "Waiting for entry"
+
+        return make_result(
+            reason=reason,
+            close_price=last_close,
+        )
 
     except Exception as e:
-        return {
-            "status": "OPEN",
-            "result": None,
-            "reason": f"Check error: {e}",
-            "close_price": None,
-        }
+        return make_result(
+            reason=f"Check error: {e}"
+        )
 
 
 def check_open_audit_trades(
@@ -935,19 +1322,84 @@ def check_open_audit_trades(
                 checked += 1
 
                 update_payload = {
-                    "last_check_at": firestore.SERVER_TIMESTAMP,
-                    "last_check_at_iso": utc_now_iso(),
-                    "last_check_reason": check_result.get("reason"),
-                    "last_check_price": check_result.get("close_price"),
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                    "updated_at_iso": utc_now_iso(),
+                    "last_check_at": (
+                        firestore.SERVER_TIMESTAMP
+                    ),
+
+                    "last_check_at_iso": (
+                        utc_now_iso()
+                    ),
+
+                    "last_check_reason": (
+                        check_result.get("reason")
+                    ),
+
+                    "last_check_price": (
+                        check_result.get(
+                            "close_price"
+                        )
+                    ),
+
+                    "entry_triggered": bool(
+                        check_result.get(
+                            "entry_triggered"
+                        )
+                    ),
+
+                    "entry_triggered_at_iso": (
+                        check_result.get(
+                            "entry_triggered_at_iso"
+                        )
+                    ),
+
+                    "tp1_hit": bool(
+                        check_result.get(
+                            "tp1_hit"
+                        )
+                    ),
+
+                    "tp1_hit_price": (
+                        check_result.get(
+                            "tp1_hit_price"
+                        )
+                    ),
+
+                    "tp1_hit_at_iso": (
+                        check_result.get(
+                            "tp1_hit_at_iso"
+                        )
+                    ),
+
+                    "highest_target_hit": int(
+                        check_result.get(
+                            "highest_target_hit"
+                        )
+                        or 0
+                    ),
+
+                    "updated_at": (
+                        firestore.SERVER_TIMESTAMP
+                    ),
+
+                    "updated_at_iso": (
+                        utc_now_iso()
+                    ),
                 }
 
                 if check_result.get("status") == "CLOSED":
                     update_payload.update({
                         "status": "CLOSED",
-                        "result": check_result.get("result"),
-                        "close_reason": check_result.get("reason"),
+                        "result": check_result.get(
+                            "result"
+                        ),
+
+                        "win_type": check_result.get(
+                            "win_type"
+                        ),
+
+                        "close_reason": check_result.get(
+                            "reason"
+                        ),
                         "close_price": check_result.get("close_price"),
                         "closed_at": firestore.SERVER_TIMESTAMP,
                         "closed_at_iso": utc_now_iso(),
@@ -980,9 +1432,37 @@ def check_open_audit_trades(
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "status": check_result.get("status"),
-                    "result": check_result.get("result"),
-                    "reason": check_result.get("reason"),
-                    "close_price": check_result.get("close_price"),
+                    "result": check_result.get(
+                        "result"
+                    ),
+
+                    "win_type": check_result.get(
+                        "win_type"
+                    ),
+
+                    "reason": check_result.get(
+                        "reason"
+                    ),
+
+                    "close_price": check_result.get(
+                        "close_price"
+                    ),
+
+                    "entry_triggered": (
+                        check_result.get(
+                            "entry_triggered"
+                        )
+                    ),
+
+                    "tp1_hit": check_result.get(
+                        "tp1_hit"
+                    ),
+
+                    "highest_target_hit": (
+                        check_result.get(
+                            "highest_target_hit"
+                        )
+                    ),
                 })
 
             except Exception as e:

@@ -1,71 +1,1378 @@
 import json
+import math
 import re
+import threading
 import time
+from collections.abc import Mapping
+
 from google import genai
 from . import config
 import pandas as pd
-from .signal_quality import enforce_backend_quality_score
 
 # --- KEY ROTATION & HYBRID LOGIC START ---
 CURRENT_KEY_INDEX = 0
+_KEY_INDEX_LOCK = threading.Lock()
+
+GEMINI_REQUEST_TIMEOUT_MS = 30_000
+GEMINI_PAID_REQUEST_TIMEOUT_MS = 90_000
+GEMINI_MIN_CALL_TIMEOUT_MS = 5_000
+GEMINI_MAX_CALL_TIMEOUT_MS = max(
+    GEMINI_REQUEST_TIMEOUT_MS,
+    GEMINI_PAID_REQUEST_TIMEOUT_MS,
+)
+GEMINI_RETRY_BASE_DELAY_SECONDS = 0.75
+GEMINI_RETRY_MAX_DELAY_SECONDS = 3.0
+MAX_PROVIDER_ERROR_LENGTH = 1_000
+MAX_RAW_RESPONSE_LENGTH = 100_000
+
+_GOOGLE_API_KEY_PATTERN = re.compile(
+    r"\bAIza[0-9A-Za-z_-]{25,}\b"
+)
 
 
-def get_next_free_client():
-    """Returns a client using the next available FREE key from the pool."""
-    global CURRENT_KEY_INDEX
+def _paid_api_key():
+    key = str(
+        getattr(
+            config,
+            "PAID_API_KEY",
+            "",
+        )
+        or ""
+    ).strip()
 
-    if not hasattr(config, "API_KEY_POOL") or not config.API_KEY_POOL:
+    return key or None
+
+
+def _free_api_keys():
+    raw_pool = getattr(
+        config,
+        "API_KEY_POOL",
+        [],
+    )
+
+    if isinstance(raw_pool, str):
+        raw_pool = [raw_pool]
+
+    if not isinstance(
+        raw_pool,
+        (
+            list,
+            tuple,
+            set,
+        ),
+    ):
+        return []
+
+    paid_key = _paid_api_key()
+
+    clean_keys = []
+    seen = set()
+
+    for raw_key in raw_pool:
+        key = str(
+            raw_key or ""
+        ).strip()
+
+        if (
+            not key
+            or key in seen
+            or key == paid_key
+        ):
+            continue
+
+        seen.add(key)
+        clean_keys.append(key)
+
+    return clean_keys
+
+
+def _safe_gemini_error(
+    error,
+):
+    """
+    Prevent API keys or very large provider errors from
+    reaching logs, API responses or Firestore debug data.
+    """
+
+    text = str(
+        error or ""
+    )
+
+    configured_keys = list(
+        _free_api_keys()
+    )
+
+    paid_key = _paid_api_key()
+
+    if paid_key:
+        configured_keys.append(
+            paid_key
+        )
+
+    for key in configured_keys:
+        text = text.replace(
+            key,
+            "[REDACTED_API_KEY]",
+        )
+
+    text = _GOOGLE_API_KEY_PATTERN.sub(
+        "[REDACTED_API_KEY]",
+        text,
+    )
+
+    text = re.sub(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f]",
+        "",
+        text,
+    )
+
+    return text[
+        :MAX_PROVIDER_ERROR_LENGTH
+    ]
+
+
+def _remaining_gemini_timeout_ms(
+    deadline_monotonic=None,
+    maximum_timeout_ms=None,
+):
+    try:
+        timeout_cap = int(
+            maximum_timeout_ms
+            if maximum_timeout_ms is not None
+            else GEMINI_REQUEST_TIMEOUT_MS
+        )
+
+    except Exception:
+        timeout_cap = GEMINI_REQUEST_TIMEOUT_MS
+
+    timeout_cap = max(
+        GEMINI_MIN_CALL_TIMEOUT_MS,
+        min(
+            GEMINI_MAX_CALL_TIMEOUT_MS,
+            timeout_cap,
+        ),
+    )
+
+    if deadline_monotonic is None:
+        return timeout_cap
+
+    try:
+        remaining_ms = int(
+            (
+                float(deadline_monotonic)
+                - time.monotonic()
+            )
+            * 1000
+        )
+
+    except Exception:
+        return timeout_cap
+
+    if remaining_ms < GEMINI_MIN_CALL_TIMEOUT_MS:
         return None
 
-    key = config.API_KEY_POOL[CURRENT_KEY_INDEX]
-    CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(config.API_KEY_POOL)
-    return genai.Client(api_key=key)
+    return min(
+        timeout_cap,
+        remaining_ms,
+    )
 
 
-def generate_content_smart(model_name, prompt):
+def _new_gemini_client(
+    api_key,
+    timeout_ms=None,
+):
+    try:
+        timeout = int(
+            timeout_ms
+            if timeout_ms is not None
+            else GEMINI_REQUEST_TIMEOUT_MS
+        )
+
+    except Exception:
+        timeout = GEMINI_REQUEST_TIMEOUT_MS
+
+    timeout = max(
+        GEMINI_MIN_CALL_TIMEOUT_MS,
+        min(
+            GEMINI_MAX_CALL_TIMEOUT_MS,
+            timeout,
+        ),
+    )
+
+    return genai.Client(
+        api_key=api_key,
+
+        http_options={
+            "timeout": timeout,
+        },
+    )
+
+
+def _close_gemini_client(
+    client,
+):
+    close_method = getattr(
+        client,
+        "close",
+        None,
+    )
+
+    if callable(close_method):
+        try:
+            close_method()
+
+        except Exception:
+            pass
+
+
+def get_next_free_client(
+    timeout_ms=None,
+):
     """
-    SMART HYBRID STRATEGY:
-    1. Try all FREE keys in the pool (Round-Robin).
-    2. If ALL free keys fail (Rate Limited 429), switch to PAID key.
-    """
-    if hasattr(config, "API_KEY_POOL") and config.API_KEY_POOL:
-        attempts = 0
-        max_free_retries = len(config.API_KEY_POOL)
+    Return the next unique, non-empty free-key client.
 
-        while attempts < max_free_retries:
-            try:
-                client = get_next_free_client()
-                if not client:
+    The index update is protected because concurrent requests
+    may execute inside the same Flask/Gunicorn worker.
+    """
+
+    global CURRENT_KEY_INDEX
+
+    keys = _free_api_keys()
+
+    if not keys:
+        return None
+
+    with _KEY_INDEX_LOCK:
+        index = (
+            CURRENT_KEY_INDEX
+            % len(keys)
+        )
+
+        CURRENT_KEY_INDEX = (
+            index + 1
+        ) % len(keys)
+
+        selected_key = keys[index]
+
+    return _new_gemini_client(
+        selected_key,
+        timeout_ms=timeout_ms,
+    )
+
+
+def _free_request_attempt_limit(
+    free_key_count,
+):
+    """
+    Give transient transport failures a few recovery attempts
+    even when only one free API key is configured.
+    """
+
+    try:
+        key_count = max(
+            int(free_key_count),
+            0,
+        )
+
+    except Exception:
+        key_count = 0
+
+    if key_count <= 0:
+        return 0
+
+    return key_count
+
+
+def _gemini_retry_delay_seconds(
+    attempt_number,
+):
+    """Return a short capped exponential retry delay."""
+
+    try:
+        attempt = max(
+            int(attempt_number),
+            1,
+        )
+
+    except Exception:
+        attempt = 1
+
+    return min(
+        GEMINI_RETRY_BASE_DELAY_SECONDS
+        * (2 ** (attempt - 1)),
+        GEMINI_RETRY_MAX_DELAY_SECONDS,
+    )
+
+def _sleep_before_gemini_retry(
+    delay_seconds,
+    deadline_monotonic=None,
+):
+    try:
+        delay = max(
+            float(delay_seconds),
+            0.0,
+        )
+
+    except Exception:
+        delay = 0.0
+
+    if delay <= 0:
+        return
+
+    if deadline_monotonic is not None:
+        try:
+            remaining = (
+                float(deadline_monotonic)
+                - time.monotonic()
+            )
+
+        except Exception:
+            remaining = delay
+
+        if remaining <= 0:
+            return
+
+        delay = min(
+            delay,
+            remaining,
+        )
+
+    time.sleep(delay)
+
+def generate_content_smart(
+    model_name,
+    prompt,
+    *,
+    deadline_monotonic=None,
+):
+    """
+    Plain-text Gemini helper used by status, guidance
+    and scanner functions.
+    """
+
+    selected_model = str(
+        model_name or ""
+    ).strip()
+
+    prompt_text = str(
+        prompt or ""
+    ).strip()
+
+    if not selected_model:
+        return json.dumps(
+            {
+                "error": (
+                    "Gemini model name is empty."
+                ),
+            }
+        )
+
+    if not prompt_text:
+        return json.dumps(
+            {
+                "error": (
+                    "Gemini prompt is empty."
+                ),
+            }
+        )
+
+    last_error = None
+
+    free_attempt_limit = (
+        _free_request_attempt_limit(
+            len(
+                _free_api_keys()
+            )
+        )
+    )
+
+    for attempt_number in range(
+        1,
+        free_attempt_limit + 1,
+    ):
+        client = None
+
+        try:
+            timeout_ms = (
+                _remaining_gemini_timeout_ms(
+                    deadline_monotonic
+                )
+            )
+
+            if timeout_ms is None:
+                last_error = (
+                    "GEMINI_DEADLINE_EXCEEDED_"
+                    "BEFORE_FREE_REQUEST"
+                )
+                break
+
+            client = get_next_free_client(
+                timeout_ms=timeout_ms
+            )
+
+            if client is None:
+                break
+
+            response = (
+                client.models.generate_content(
+                    model=selected_model,
+                    contents=prompt_text,
+                )
+            )
+
+            response_text = str(
+                getattr(
+                    response,
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not response_text:
+                raise ValueError(
+                    "Gemini returned an empty text response."
+                )
+
+            return response_text
+
+        except Exception as exc:
+            last_error = (
+                _safe_gemini_error(
+                    exc
+                )
+            )
+
+            if _is_retryable_gemini_error(
+                exc
+            ):
+                print(
+                    "Gemini free-key request failed "
+                    "temporarily; retrying "
+                    f"({attempt_number}/"
+                    f"{free_attempt_limit})."
+                )
+
+                if attempt_number >= free_attempt_limit:
                     break
 
-                response = client.models.generate_content(model=model_name, contents=prompt)
-                return response.text
+                _sleep_before_gemini_retry(
+                    _gemini_retry_delay_seconds(
+                        attempt_number
+                    ),
+                    deadline_monotonic,
+                )
+                continue
 
-            except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg or "ResourceExhausted" in error_msg or "Quota" in error_msg:
-                    print(f"⚠️ Free Key {CURRENT_KEY_INDEX} Rate Limited. Switching to next...")
-                    attempts += 1
-                    time.sleep(0.5)
-                    continue
-                else:
-                    print(f"❌ AI Logic Error (Non-Limit): {error_msg}")
-                    return json.dumps({"error": str(e)})
+            print(
+                "Gemini request failed: "
+                f"{last_error}"
+            )
 
-    print("⚠️ All Free Keys Exhausted! Switching to PAID KEY Backup...")
+            return json.dumps(
+                {
+                    "error": (
+                        last_error
+                        or "GEMINI_REQUEST_FAILED"
+                    ),
+                }
+            )
 
-    if hasattr(config, "PAID_API_KEY") and config.PAID_API_KEY:
+        finally:
+            _close_gemini_client(
+                client
+            )
+
+    paid_key = _paid_api_key()
+
+    if paid_key:
+        client = None
+
         try:
-            client = genai.Client(api_key=config.PAID_API_KEY)
-            response = client.models.generate_content(model=model_name, contents=prompt)
-            print("✅ Success using PAID KEY.")
-            return response.text
-        except Exception as e:
-            print(f"❌ Paid Key Failed: {e}")
-            return json.dumps({"error": f"PAID_KEY_FAILED: {str(e)}"})
+            timeout_ms = (
+                _remaining_gemini_timeout_ms(
+                    deadline_monotonic,
+                    maximum_timeout_ms=(
+                        GEMINI_PAID_REQUEST_TIMEOUT_MS
+                    ),
+                )
+            )
 
-    return json.dumps({"error": "ALL_SYSTEMS_BUSY (No Keys Available)"})
+            if timeout_ms is None:
+                return json.dumps(
+                    {
+                        "error": (
+                            last_error
+                            or (
+                                "GEMINI_DEADLINE_EXCEEDED_"
+                                "BEFORE_PAID_REQUEST"
+                            )
+                        ),
+                    }
+                )
 
+            client = _new_gemini_client(
+                paid_key,
+                timeout_ms=timeout_ms,
+            )
+
+            response = (
+                client.models.generate_content(
+                    model=selected_model,
+                    contents=prompt_text,
+                )
+            )
+
+            response_text = str(
+                getattr(
+                    response,
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not response_text:
+                raise ValueError(
+                    "Gemini paid-key response was empty."
+                )
+
+            return response_text
+
+        except Exception as exc:
+            last_error = (
+                _safe_gemini_error(
+                    exc
+                )
+            )
+
+            print(
+                "Gemini paid-key request failed: "
+                f"{last_error}"
+            )
+
+            return json.dumps(
+                {
+                    "error": (
+                        "PAID_KEY_FAILED: "
+                        f"{last_error}"
+                    ),
+                }
+            )
+
+        finally:
+            _close_gemini_client(
+                client
+            )
+
+    return json.dumps(
+        {
+            "error": (
+                last_error
+                or "ALL_SYSTEMS_BUSY_NO_KEYS_AVAILABLE"
+            ),
+        }
+    )
+
+
+def _is_retryable_gemini_error(
+    error,
+):
+    """
+    Return True only for quota, temporary service
+    and network failures.
+    """
+
+    error_code = None
+
+    for attribute in (
+        "code",
+        "status_code",
+        "http_status",
+    ):
+        value = getattr(
+            error,
+            attribute,
+            None,
+        )
+
+        if callable(value):
+            try:
+                value = value()
+
+            except Exception:
+                value = None
+
+        try:
+            if value is not None:
+                error_code = int(
+                    value
+                )
+
+                break
+
+        except Exception:
+            pass
+
+    text = str(
+        error or ""
+    )
+
+    if error_code is None:
+        match = re.search(
+            r"(?<!\d)"
+            r"(408|409|429|500|502|503|504)"
+            r"(?!\d)",
+            text,
+        )
+
+        if match:
+            error_code = int(
+                match.group(1)
+            )
+
+    if error_code in {
+        408,
+        409,
+        429,
+        500,
+        502,
+        503,
+        504,
+    }:
+        return True
+
+    lowered = (
+        f"{type(error).__name__} {text}"
+    ).lower()
+
+    retryable_markers = (
+        "resourceexhausted",
+        "resource exhausted",
+        "quota exceeded",
+        "rate limit",
+        "too many requests",
+        "service unavailable",
+        "temporarily unavailable",
+        "deadline exceeded",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote protocol error",
+        "remoteprotocolerror",
+        "server disconnected",
+        "without sending a response",
+        "connection closed",
+        "connection terminated",
+        "peer closed connection",
+        "incomplete chunked read",
+        "unexpected eof",
+        "readtimeout",
+        "connecttimeout",
+        "readerror",
+        "connecterror",
+    )
+
+    return any(
+        marker in lowered
+        for marker in retryable_markers
+    )
+
+
+def _reject_non_finite_json(
+    value,
+):
+    raise ValueError(
+        "Gemini structured response contains "
+        f"non-finite JSON value: {value}"
+    )
+
+
+def _ensure_json_object(
+    value,
+):
+    if not isinstance(
+        value,
+        Mapping,
+    ):
+        raise ValueError(
+            "Gemini structured response is not a JSON object."
+        )
+
+    data = dict(
+        value
+    )
+
+    json.dumps(
+        data,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    return data
+
+
+def _parse_structured_gemini_response(
+    response,
+):
+    """
+    Convert a Gemini structured response into a finite,
+    JSON-serializable dictionary.
+    """
+
+    if response is None:
+        raise ValueError(
+            "Gemini returned no response object."
+        )
+
+    parsed = getattr(
+        response,
+        "parsed",
+        None,
+    )
+
+    if isinstance(
+        parsed,
+        Mapping,
+    ):
+        return _ensure_json_object(
+            parsed
+        )
+
+    if parsed is not None:
+        if hasattr(
+            parsed,
+            "model_dump",
+        ):
+            return _ensure_json_object(
+                parsed.model_dump()
+            )
+
+        if hasattr(
+            parsed,
+            "dict",
+        ):
+            return _ensure_json_object(
+                parsed.dict()
+            )
+
+    raw_text = str(
+        getattr(
+            response,
+            "text",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not raw_text:
+        raise ValueError(
+            "Gemini returned an empty structured response."
+        )
+
+    if len(
+        raw_text
+    ) > MAX_RAW_RESPONSE_LENGTH:
+        raise ValueError(
+            "Gemini structured response exceeded "
+            "the allowed raw-text size."
+        )
+
+    raw_text = raw_text.lstrip(
+        "\ufeff"
+    )
+
+    if raw_text.startswith(
+        "```"
+    ):
+        raw_text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+
+        raw_text = re.sub(
+            r"\s*```$",
+            "",
+            raw_text,
+        ).strip()
+
+    parsed_json = json.loads(
+        raw_text,
+
+        parse_constant=(
+            _reject_non_finite_json
+        ),
+    )
+
+    return _ensure_json_object(
+        parsed_json
+    )
+
+
+def _extract_gemini_usage_metadata(response):
+    """
+    Returns token usage metadata without exposing API keys.
+    """
+    usage = getattr(
+        response,
+        "usage_metadata",
+        None,
+    )
+
+    if usage is None:
+        return {}
+
+    if isinstance(usage, dict):
+        return usage
+
+    if hasattr(usage, "model_dump"):
+        try:
+            dumped = usage.model_dump()
+
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+
+    if hasattr(usage, "dict"):
+        try:
+            dumped = usage.dict()
+
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+
+    return {
+        "raw": str(usage),
+    }
+
+
+def _generate_content_with_diagnostics(
+    client,
+    *,
+    model,
+    contents,
+    config,
+    key_source,
+    attempt,
+    timeout_ms,
+):
+    started = time.monotonic()
+    label = f"{key_source} attempt={attempt}"
+    print(
+        f"[GEMINI_CALL] START {label} "
+        f"timeout_ms={timeout_ms}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        print(
+            f"[GEMINI_CALL] ERROR {label} "
+            f"elapsed_s={elapsed:.2f} "
+            f"type={type(exc).__name__} "
+            f"error={_safe_gemini_error(exc)!r}"
+        )
+        raise
+
+    elapsed = time.monotonic() - started
+    try:
+        usage = _extract_gemini_usage_metadata(response)
+        candidates = getattr(response, "candidates", None) or []
+        finish = (
+            getattr(candidates[0], "finish_reason", None)
+            if candidates else None
+        )
+        finish = getattr(finish, "value", finish)
+        print(
+            f"[GEMINI_CALL] RESPONSE {label} "
+            f"elapsed_s={elapsed:.2f} "
+            f"finish_reason={finish!r} "
+            f"input_tokens={usage.get('prompt_token_count')!r} "
+            f"thinking_tokens={usage.get('thoughts_token_count')!r} "
+            f"output_tokens={usage.get('candidates_token_count')!r}"
+        )
+    except Exception:
+        print(
+            f"[GEMINI_CALL] RESPONSE {label} "
+            f"elapsed_s={elapsed:.2f} metadata_unavailable"
+        )
+
+    return response
+
+def generate_structured_content_smart(
+    model_name,
+    prompt,
+    response_json_schema,
+    *,
+    system_instruction=None,
+    temperature=0.1,
+    top_p=0.2,
+    max_output_tokens=12288,
+    deadline_monotonic=None,
+):
+    """
+    Generate a strict JSON response using Gemini JSON Schema.
+
+    Key strategy:
+    1. Try each configured free key.
+    2. Retry another key only for quota/network/service errors.
+    3. Fall back to the configured paid key.
+    4. Never expose the actual key in the result.
+
+    Returns:
+    {
+        "ok": True/False,
+        "data": {...} or None,
+        "raw_text": "...",
+        "model": "...",
+        "key_source": "FREE_POOL" / "PAID_BACKUP" / None,
+        "usage": {...},
+        "error": None or "...",
+    }
+    """
+
+    selected_model = str(
+        model_name or ""
+    ).strip()
+
+    prompt_text = str(
+        prompt or ""
+    ).strip()
+
+    if not selected_model:
+        return {
+            "ok": False,
+            "data": None,
+            "raw_text": "",
+            "model": "",
+            "key_source": None,
+            "usage": {},
+            "error": (
+                "Gemini model name is empty."
+            ),
+        }
+
+    if not prompt_text:
+        return {
+            "ok": False,
+            "data": None,
+            "raw_text": "",
+            "model": selected_model,
+            "key_source": None,
+            "usage": {},
+            "error": "Prompt is empty.",
+        }
+
+    if not isinstance(
+        response_json_schema,
+        dict,
+    ):
+        return {
+            "ok": False,
+            "data": None,
+            "raw_text": "",
+            "model": selected_model,
+            "key_source": None,
+            "usage": {},
+            "error": (
+                "response_json_schema must be "
+                "a dictionary."
+            ),
+        }
+
+    try:
+        json.dumps(
+            response_json_schema,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+        temperature_value = float(
+            temperature
+        )
+
+        top_p_value = float(
+            top_p
+        )
+
+        max_tokens_value = int(
+            max_output_tokens
+        )
+
+        if not (
+            math.isfinite(
+                temperature_value
+            )
+            and 0.0
+            <= temperature_value
+            <= 2.0
+        ):
+            raise ValueError(
+                "temperature must be between 0 and 2."
+            )
+
+        if not (
+            math.isfinite(
+                top_p_value
+            )
+            and 0.0
+            <= top_p_value
+            <= 1.0
+        ):
+            raise ValueError(
+                "top_p must be between 0 and 1."
+            )
+
+        if max_tokens_value <= 0:
+            raise ValueError(
+                "max_output_tokens must be "
+                "greater than zero."
+            )
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "data": None,
+            "raw_text": "",
+            "model": selected_model,
+            "key_source": None,
+            "usage": {},
+            "error": (
+                "Invalid Gemini generation configuration: "
+                + _safe_gemini_error(
+                    exc
+                )
+            ),
+        }
+
+    generation_config = {
+        "response_mime_type": "application/json",
+        "response_json_schema": response_json_schema,
+        "max_output_tokens": max_tokens_value,
+    }
+
+    instruction_text = str(
+        system_instruction or ""
+    ).strip()
+
+    if instruction_text:
+        generation_config[
+            "system_instruction"
+        ] = instruction_text
+
+    last_error = None
+
+    # Allow only one extra Gemini call when the returned
+    # structured JSON is malformed, truncated or empty.
+    structured_response_retry_used = False
+
+    free_keys = _free_api_keys()
+
+    # --------------------------------------------------
+    # Try all configured FREE keys.
+    # --------------------------------------------------
+    if free_keys:
+        attempts = 0
+        max_free_attempts = len(
+            free_keys
+        )
+
+        while attempts < max_free_attempts:
+            client = None
+
+            try:
+                timeout_ms = (
+                    _remaining_gemini_timeout_ms(
+                        deadline_monotonic
+                    )
+                )
+
+                if timeout_ms is None:
+                    last_error = (
+                        "GEMINI_DEADLINE_EXCEEDED_"
+                        "BEFORE_FREE_REQUEST"
+                    )
+                    break
+
+                client = get_next_free_client(
+                    timeout_ms=timeout_ms
+                )
+
+                if client is None:
+                    break
+
+                attempts += 1
+
+                response = _generate_content_with_diagnostics(
+                    client,
+                    model=selected_model,
+                    contents=prompt_text,
+                    config=generation_config,
+                    key_source="FREE_POOL",
+                    attempt=attempts,
+                    timeout_ms=timeout_ms,
+                )
+
+                parsed_data = (
+                    _parse_structured_gemini_response(
+                        response
+                    )
+                )
+
+                return {
+                    "ok": True,
+                    "data": parsed_data,
+                    "raw_text": str(
+                        getattr(
+                            response,
+                            "text",
+                            "",
+                        )
+                        or ""
+                    )[:MAX_RAW_RESPONSE_LENGTH],
+                    "model": selected_model,
+                    "key_source": "FREE_POOL",
+                    "usage": (
+                        _extract_gemini_usage_metadata(
+                            response
+                        )
+                    ),
+                    "error": None,
+                }
+
+            except Exception as exc:
+                last_error = (
+                    _safe_gemini_error(
+                        exc
+                    )
+                )
+
+                error_text_lower = str(
+                    exc or ""
+                ).lower()
+
+                structured_response_failed = (
+                    isinstance(
+                        exc,
+                        json.JSONDecodeError,
+                    )
+                    or (
+                        "empty structured response"
+                        in error_text_lower
+                    )
+                    or (
+                        "must be a json object"
+                        in error_text_lower
+                    )
+                )
+
+                # Gemini occasionally returns truncated or malformed
+                # structured JSON. Retry the request only once.
+                if structured_response_failed:
+                    if (
+                        not structured_response_retry_used
+                        and attempts < max_free_attempts
+                    ):
+                        structured_response_retry_used = True
+
+                        print(
+                            "Structured Gemini response was malformed "
+                            "or incomplete. Retrying once..."
+                        )
+
+                        _sleep_before_gemini_retry(
+                            0.25,
+                            deadline_monotonic,
+                        )
+                        continue
+
+                    break
+
+                if _is_retryable_gemini_error(
+                    exc
+                ):
+                    print(
+                        "Structured Gemini free-key "
+                        "request failed temporarily. "
+                        "Retrying "
+                        f"({attempts}/"
+                        f"{max_free_attempts})..."
+                    )
+
+                    if attempts >= max_free_attempts:
+                        break
+
+                    _sleep_before_gemini_retry(
+                        _gemini_retry_delay_seconds(
+                            attempts
+                        ),
+                        deadline_monotonic,
+                    )
+                    continue
+
+                print(
+                    "Structured Gemini request failed: "
+                    f"{last_error}"
+                )
+
+                return {
+                    "ok": False,
+                    "data": None,
+                    "raw_text": "",
+                    "model": selected_model,
+                    "key_source": "FREE_POOL",
+                    "usage": {},
+                    "error": (
+                        last_error
+                        or "GEMINI_STRUCTURED_REQUEST_FAILED"
+                    ),
+                }
+
+            finally:
+                _close_gemini_client(
+                    client
+                )
+
+    # --------------------------------------------------
+    # Paid-key fallback.
+    # --------------------------------------------------
+    print(
+        "Structured Gemini free keys unavailable. "
+        "Switching to paid-key backup..."
+    )
+
+    paid_key = _paid_api_key()
+
+    if paid_key:
+        client = None
+
+        try:
+            timeout_ms = (
+                _remaining_gemini_timeout_ms(
+                    deadline_monotonic,
+                    maximum_timeout_ms=(
+                        GEMINI_PAID_REQUEST_TIMEOUT_MS
+                    ),
+                )
+            )
+
+            if timeout_ms is None:
+                return {
+                    "ok": False,
+                    "data": None,
+                    "raw_text": "",
+                    "model": selected_model,
+                    "key_source": None,
+                    "usage": {},
+                    "error": (
+                        last_error
+                        or (
+                            "GEMINI_DEADLINE_EXCEEDED_"
+                            "BEFORE_PAID_REQUEST"
+                        )
+                    ),
+                }
+
+            client = _new_gemini_client(
+                paid_key,
+                timeout_ms=timeout_ms,
+            )
+
+            response = _generate_content_with_diagnostics(
+                client,
+                model=selected_model,
+                contents=prompt_text,
+                config=generation_config,
+                key_source="PAID_BACKUP",
+                attempt=1,
+                timeout_ms=timeout_ms,
+            )
+
+            parsed_data = (
+                _parse_structured_gemini_response(
+                    response
+                )
+            )
+
+            print(
+                "Structured Gemini request succeeded "
+                "using paid-key backup."
+            )
+
+            return {
+                "ok": True,
+                "data": parsed_data,
+                "raw_text": str(
+                    getattr(
+                        response,
+                        "text",
+                        "",
+                    )
+                    or ""
+                )[:MAX_RAW_RESPONSE_LENGTH],
+                "model": selected_model,
+                "key_source": "PAID_BACKUP",
+                "usage": (
+                    _extract_gemini_usage_metadata(
+                        response
+                    )
+                ),
+                "error": None,
+            }
+
+        except Exception as exc:
+            last_error = (
+                _safe_gemini_error(
+                    exc
+                )
+            )
+
+            print(
+                "Structured Gemini paid-key request "
+                f"failed: {last_error}"
+            )
+
+            return {
+                "ok": False,
+                "data": None,
+                "raw_text": "",
+                "model": selected_model,
+                "key_source": "PAID_BACKUP",
+                "usage": {},
+                "error": (
+                    "PAID_KEY_FAILED: "
+                    f"{last_error}"
+                ),
+            }
+
+        finally:
+            _close_gemini_client(
+                client
+            )
+
+    return {
+        "ok": False,
+        "data": None,
+        "raw_text": "",
+        "model": selected_model,
+        "key_source": None,
+        "usage": {},
+        "error": (
+            last_error
+            or "ALL_SYSTEMS_BUSY_NO_KEYS_AVAILABLE"
+        ),
+    }
 
 # --- KEY ROTATION LOGIC END ---
 
@@ -269,6 +1576,99 @@ def _force_wait_scenario(summary="Setup unclear. Wait for confirmation."):
     }
 
 
+def _normalize_ai_review(
+    data,
+):
+    """
+    Keep the legacy backend-review path fail-closed.
+
+    Missing, malformed or unsupported review decisions must
+    become REJECT_TO_WAIT rather than accidental approval.
+    """
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return data
+
+    review = data.get(
+        "ai_review"
+    )
+
+    if not isinstance(
+        review,
+        dict,
+    ):
+        review = {}
+
+    allowed = {
+        "APPROVE_BACKEND_PRIMARY",
+        "REJECT_TO_WAIT",
+    }
+
+    decision = str(
+        review.get(
+            "decision"
+        )
+        or "REJECT_TO_WAIT"
+    ).upper().strip()
+
+    preferred_rank = review.get(
+        "preferred_candidate_rank"
+    )
+
+    if decision.startswith(
+        "PREFER_CANDIDATE_"
+    ):
+        preferred_rank = decision.replace(
+            "PREFER_CANDIDATE_",
+            "",
+        ).strip()
+
+        decision = "REJECT_TO_WAIT"
+
+    if decision not in allowed:
+        decision = "REJECT_TO_WAIT"
+
+    review["decision"] = decision
+
+    review[
+        "preferred_candidate_rank"
+    ] = preferred_rank
+
+    review["reason"] = str(
+        review.get("reason")
+        or (
+            "AI review was missing or invalid; "
+            "defaulted to WAIT."
+        )
+    )
+
+    review["risk_notes"] = str(
+        review.get(
+            "risk_notes"
+        )
+        or ""
+    )
+
+    review["tp_sl_notes"] = str(
+        review.get(
+            "tp_sl_notes"
+        )
+        or ""
+    )
+
+    review["is_safe_to_show"] = (
+        decision
+        == "APPROVE_BACKEND_PRIMARY"
+    )
+
+    data["ai_review"] = review
+
+    return data
+
+
 def get_timeframe_profile_text(user_tf, market_type="crypto"):
     """
     LEAD AI v2: Universal Timeframe Profile
@@ -410,6 +1810,16 @@ def _normalize_ai_output(data):
 
     if str(s.get("trade_type", "")).upper() == "WAIT":
         advice = str(data.get("action_advice", "")).lower()
+        # If final output is WAIT, do not let advice sound like an approved Elliott signal.
+        raw_advice = str(data.get("action_advice", "")).strip()
+        if raw_advice.lower().startswith("elliott wave: yes"):
+            data["action_advice"] = re.sub(
+                r"^\s*elliott\s+wave\s*:\s*yes",
+                "Elliott Wave: NO",
+                raw_advice,
+                count=1,
+                flags=re.IGNORECASE,
+            )
 
         blocked_words = [
             "buy at",
@@ -580,6 +1990,319 @@ def generate_status_update(scenario, df_recent):
     except Exception:
         return "Market data analyzed. Monitor key levels."
 
+def generate_trade_guidance_advice(scenario, guidance_facts, guidance_context_text):
+    """
+    AI explanation layer for existing locked/global trade guidance.
+
+    Backend owns facts and hard status.
+    AI only writes user-friendly advice.
+    AI must NOT create/modify entry, SL, TP1, TP2.
+    """
+    has_pool = hasattr(config, "API_KEY_POOL") and config.API_KEY_POOL
+    has_paid = hasattr(config, "PAID_API_KEY") and config.PAID_API_KEY
+
+    if not has_pool and not has_paid:
+        return {
+            "ai_guidance_available": False,
+            "ai_guidance": guidance_facts.get(
+                "user_guidance",
+                "Market data analyzed. Follow original TP/SL plan."
+            ),
+            "ai_guidance_action": guidance_facts.get("action", "HOLD"),
+            "ai_risk_level": guidance_facts.get("risk_level", "UNKNOWN"),
+            "source": "BACKEND_FALLBACK_NO_AI_KEY",
+        }
+
+    try:
+        scenario = scenario or {}
+        guidance_facts = guidance_facts or {}
+        facts = guidance_facts.get("facts") or {}
+
+        prompt = f"""
+You are a trade mentor giving advice for an EXISTING GLOBAL SIGNAL.
+
+IMPORTANT:
+- The backend already calculated the trade status and risk facts.
+- You MUST use backend facts as truth.
+- You MUST NOT create a new trade.
+- You MUST NOT change entry, stop loss, TP1, or TP2.
+- You MUST NOT suggest a new entry, new SL, or new target.
+- You are only writing user guidance for the existing signal.
+
+EXISTING SIGNAL:
+Symbol/Name: {scenario.get("symbol", "")} {scenario.get("name", "")}
+Side: {scenario.get("trade_type") or scenario.get("side")}
+Entry: {scenario.get("entry") or scenario.get("entry_zone")}
+Stop Loss: {scenario.get("stop_loss") or scenario.get("invalidation")}
+Targets: {scenario.get("targets") or [scenario.get("target")]}
+Current Scenario Status: {scenario.get("status", "")}
+Original Summary: {scenario.get("summary", "")}
+
+BACKEND HARD GUIDANCE:
+Guidance Status: {guidance_facts.get("guidance_status", "")}
+Risk Level: {guidance_facts.get("risk_level", "")}
+Backend Action: {guidance_facts.get("action", "")}
+Danger Score: {guidance_facts.get("danger_score", 0)}
+Danger Flags: {guidance_facts.get("danger_flags", [])}
+Backend Advice: {guidance_facts.get("backend_advice", "")}
+Backend User Guidance: {guidance_facts.get("user_guidance", "")}
+Management Mode: {guidance_facts.get("management_mode", "")}
+TP2 Probability: {guidance_facts.get("tp2_probability", "")}
+Reversal Risk: {guidance_facts.get("reversal_risk", "")}
+Profit Action: {guidance_facts.get("profit_action", "")}
+SL Management: {guidance_facts.get("sl_management", "")}
+Short Action Text: {guidance_facts.get("short_action_text", "")}
+Exit Trigger: {guidance_facts.get("exit_trigger", "")}
+
+BACKEND FACTS:
+{guidance_context_text}
+
+CRITICAL RULES:
+1. Backend facts are the source of truth. Follow Management Mode, Profit Action, SL Management, TP2 Probability, Reversal Risk, and Exit Trigger.
+2. Start the advice with the backend Short Action Text when available.
+3. If Guidance Status is TP1_PARTIAL_WIN, say TP1 profit was secured and the remaining runner later closed at SL. Treat it as a closed partial win, not a loss.
+4. If Guidance Status is TP2_HIT or TP2 Hit is True, say the main target is completed.
+5. If backend says CLOSE_CONFIRMED or SL_HIT_CONFIRMED, say the trade is invalidated/closed. Do not say hold.
+6. If TP1 Hit is False, clearly say TP1 is not confirmed yet. Do not suggest partial profit.
+7. If Management Mode is HOLD_FOR_TP2, say TP1 partial profit is secured and only the remaining runner should be held toward TP2.
+8. If Management Mode is HOLD_WITH_CAUTION, say TP1 partial is secured and only the runner should be held with caution.
+9. If Management Mode is PROTECT_PROFIT, say TP1 partial is secured and the remaining runner needs defensive management. Do not mention any fixed percentage.
+10. If Management Mode is DEFENSIVE_RUNNER_TO_MAGNET_TEST, say TP1 partial is secured, do not add, and manage only the remaining runner around the backend exit trigger.
+11. If Management Mode is CLOSE_FULL, say close the remaining runner after TP1. Do not imply that the original full position is still open.
+12. Do NOT advise automatic breakeven just because TP1 is hit.
+13. Do NOT tell the user to move SL to entry unless backend SL Management explicitly says so.
+14. If SL Management is STRUCTURE_TRAIL_ONLY, say trail only by market structure.
+15. If Entry Hit is False and backend action is WAIT_FOR_ENTRY/WAIT_ENTRY, say the limit order is still pending and do not chase.
+16. If backend says MISSED / DO_NOT_CHASE, clearly say the setup is missed and should not be chased.
+17. Keep advice practical for a beginner.
+18. Keep advice short: maximum 2 short sentences.
+19. Do not mention hidden calculations, internal code, or percentages that backend did not provide.
+
+OUTPUT JSON ONLY:
+{{
+  "ai_guidance_available": true,
+  "ai_guidance_action": "WAIT_ENTRY/HOLD/HOLD_TO_TP1/HOLD_FOR_TP2/HOLD_WITH_CAUTION/PROTECT_PROFIT/DEFENSIVE_RUNNER_TO_MAGNET_TEST/DO_NOT_CHASE/CLOSE_FULL/CLOSE_CONFIRMED/PARTIAL_WIN_CONFIRMED/TAKE_PROFIT_CONFIRMED",
+  "ai_risk_level": "LOW/MEDIUM/HIGH/CLOSED",
+  "ai_guidance": "Maximum 2 short sentences. Start with ACTION. Follow backend Management Mode exactly.",
+  "key_warning": "One short warning if needed, otherwise empty string.",
+  "should_user_chase": false,
+  "can_hold_for_tp2": true,
+  "breakeven_note": "Explain whether breakeven is appropriate or not, based only on backend facts."
+}}
+"""
+
+        raw_text = generate_content_smart(config.MODEL_FAST, prompt)
+
+        if not raw_text or '{"error"' in str(raw_text):
+            return {
+                "ai_guidance_available": False,
+                "ai_guidance": guidance_facts.get(
+                    "user_guidance",
+                    "Market data analyzed. Follow original TP/SL plan."
+                ),
+                "ai_guidance_action": guidance_facts.get("action", "HOLD"),
+                "ai_risk_level": guidance_facts.get("risk_level", "UNKNOWN"),
+                "source": "BACKEND_FALLBACK_AI_ERROR",
+            }
+
+        cleaned_text = str(raw_text).replace("```json", "").replace("```", "").strip()
+        match = re.search(r"\{.*\}", cleaned_text, re.DOTALL)
+
+        if not match:
+            return {
+                "ai_guidance_available": False,
+                "ai_guidance": guidance_facts.get(
+                    "user_guidance",
+                    "Market data analyzed. Follow original TP/SL plan."
+                ),
+                "ai_guidance_action": guidance_facts.get("action", "HOLD"),
+                "ai_risk_level": guidance_facts.get("risk_level", "UNKNOWN"),
+                "source": "BACKEND_FALLBACK_NO_JSON",
+            }
+
+        data = json.loads(match.group(0))
+
+        # Safety normalization
+        allowed_actions = {
+            "NO_ACTION",
+            "WAIT",
+            "WAIT_ENTRY",
+            "WAIT_FOR_ENTRY",
+            "HOLD",
+            "HOLD_TO_TP1",
+            "HOLD_FOR_TP2",
+            "HOLD_WITH_CAUTION",
+            "TAKE_PARTIAL",
+            "TAKE_PARTIAL_HOLD_TP2",
+            "PROTECT_PROFIT",
+            "DEFENSIVE_RUNNER_TO_MAGNET_TEST",
+            "REDUCE_OR_CLOSE",
+            "DO_NOT_CHASE",
+            "CANCEL_PENDING",
+            "PARTIAL_WIN_CONFIRMED",
+            "CLOSE_CONFIRMED",
+            "SL_HIT_CONFIRMED",
+            "TAKE_PROFIT_CONFIRMED",
+            "CLOSE_FULL",
+        }
+
+        action = str(data.get("ai_guidance_action") or guidance_facts.get("action") or "HOLD").upper()
+        if action not in allowed_actions:
+            action = str(guidance_facts.get("action") or "HOLD").upper()
+            if action not in allowed_actions:
+                action = "HOLD"
+
+        risk = str(data.get("ai_risk_level") or guidance_facts.get("risk_level") or "UNKNOWN").upper()
+        if risk not in ["LOW", "MEDIUM", "HIGH", "CLOSED", "UNKNOWN"]:
+            risk = str(guidance_facts.get("risk_level") or "UNKNOWN").upper()
+
+        ai_guidance = str(data.get("ai_guidance") or "").strip()
+        if not ai_guidance:
+            ai_guidance = guidance_facts.get(
+                "user_guidance",
+                "Market data analyzed. Follow original TP/SL plan."
+            )
+
+        # Hard override safety:
+        # If backend says TP2 hit, AI cannot say keep holding.
+        if guidance_facts.get("guidance_status") == "TP2_HIT":
+            action = "TAKE_PROFIT_CONFIRMED"
+            risk = "CLOSED"
+            ai_guidance = guidance_facts.get(
+                "user_guidance",
+                "TP2 hit. This trade idea has completed its main target."
+            )
+
+        # Hard override safety:
+        # TP1 was secured and the remaining runner later stopped.
+        if guidance_facts.get("guidance_status") == "TP1_PARTIAL_WIN":
+            action = "PARTIAL_WIN_CONFIRMED"
+            risk = "CLOSED"
+
+            ai_guidance = guidance_facts.get(
+                "user_guidance",
+                (
+                    "ACTION: PARTIAL WIN CLOSED. "
+                    "TP1 profit was secured and the remaining "
+                    "runner later hit SL."
+                ),
+            )
+
+        # Hard override safety:
+        # If backend says SL hit, AI cannot say hold.
+        if guidance_facts.get("guidance_status") == "CLOSE_CONFIRMED":
+            action = "CLOSE_CONFIRMED"
+            risk = "CLOSED"
+            if "hold" in ai_guidance.lower():
+                ai_guidance = guidance_facts.get(
+                    "user_guidance",
+                    "SL hit confirmed. This setup is invalidated/closed."
+                )
+
+        # Hard override safety:
+        # If backend says close after TP1 reversal,
+        # only the remaining runner is being closed.
+        if guidance_facts.get("management_mode") == "CLOSE_FULL":
+            action = "CLOSE_FULL"
+            risk = "HIGH"
+
+            ai_guidance = guidance_facts.get(
+                "user_guidance",
+                (
+                    "ACTION: CLOSE REMAINING RUNNER. "
+                    "TP1 partial profit was secured, but reversal "
+                    "is now confirmed. Do not wait for TP2."
+                ),
+            )
+
+        # Hard override safety:
+        # Every open post-TP1 mode manages only the remaining runner.
+        runner_management_modes = {
+            "HOLD_FOR_TP2",
+            "HOLD_WITH_CAUTION",
+            "PROTECT_PROFIT",
+            "DEFENSIVE_RUNNER_TO_MAGNET_TEST",
+        }
+
+        management_mode = str(
+            guidance_facts.get("management_mode")
+            or ""
+        ).upper().strip()
+
+        if management_mode in runner_management_modes:
+            backend_action = str(
+                guidance_facts.get("action")
+                or management_mode
+            ).upper().strip()
+
+            if backend_action in allowed_actions:
+                action = backend_action
+
+            risk = guidance_facts.get(
+                "risk_level",
+                risk,
+            )
+
+            lower_text = ai_guidance.lower()
+
+            blocked_full_position_phrases = (
+                "do not take partial",
+                "without taking partial",
+                "hold the full position",
+                "no partial",
+            )
+
+            has_partial_policy = (
+                "partial" in lower_text
+            )
+
+            has_runner_policy = any(
+                marker in lower_text
+                for marker in (
+                    "runner",
+                    "remaining",
+                    "the rest",
+                )
+            )
+
+            if (
+                not has_partial_policy
+                or not has_runner_policy
+                or any(
+                    phrase in lower_text
+                    for phrase in blocked_full_position_phrases
+                )
+            ):
+                ai_guidance = guidance_facts.get(
+                    "user_guidance",
+                    (
+                        "ACTION: SECURE TP1 PARTIAL, MANAGE RUNNER. "
+                        "Keep only the remaining runner active and "
+                        "follow the backend exit trigger."
+                    ),
+                )
+
+        data["ai_guidance_available"] = True
+        data["ai_guidance_action"] = action
+        data["ai_risk_level"] = risk
+        data["ai_guidance"] = ai_guidance
+        data["source"] = "AI_GUIDANCE_WITH_BACKEND_FACTS"
+
+        return data
+
+    except Exception as e:
+        return {
+            "ai_guidance_available": False,
+            "ai_guidance": guidance_facts.get(
+                "user_guidance",
+                "Market data analyzed. Follow original TP/SL plan."
+            ) if isinstance(guidance_facts, dict) else "Market data analyzed. Follow original TP/SL plan.",
+            "ai_guidance_action": guidance_facts.get("action", "HOLD") if isinstance(guidance_facts, dict) else "HOLD",
+            "ai_risk_level": guidance_facts.get("risk_level", "UNKNOWN") if isinstance(guidance_facts, dict) else "UNKNOWN",
+            "source": "BACKEND_FALLBACK_EXCEPTION",
+            "error": str(e),
+        }
+
 
 # --- MAIN ANALYSIS FUNCTION ---
 def generate_mtf_analysis(
@@ -712,10 +2435,10 @@ def generate_mtf_analysis(
         IMPORTANT ELLIOTT PATTERN TYPE GUIDE:
         - [Impulse] means bullish 1-2-3-4-5 structure: Up, Down, Up, Down, Up.
         - [BearishImpulse] means bearish 1-2-3-4-5 structure: Down, Up, Down, Up, Down.
-        - [Correction] means A-B-C corrective movement.
-        - Do NOT treat BearishImpulse waves as bullish waves.
-        - If Elliott pattern type conflicts with macro trend, support/resistance, or current price action, reduce confidence or return WAIT.
-        - Wave lists are backend-filtered by timeframe recency and max shown count. Prefer the latest shown wave summary over older labels.
+        - [Correction] means bullish A-B-C corrective movement (A-Down, B-Up, C-Down).
+        - [BearishCorrection] means bearish A-B-C corrective movement (A-Up, B-Down, C-Up).
+        - IMPORTANT: [BearishImpulse] and [BearishCorrection] are STRICTLY BEARISH signals.
+        - Do NOT treat Bearish labels as bullish.
         [MACRO WAVES DETECTED - Daily]:
         {macro_structure_text}
 
@@ -818,164 +2541,139 @@ def generate_mtf_analysis(
             """
         else:
             prompt = f"""
-            Act as an expert Elliott Wave analyst and professional crypto signal strategist.
+            Act as an expert Elliott Wave analyst, setup reviewer, and beginner-friendly trade mentor.
 
             {base_context}
 
-            TASK:
-            Analyze the market using:
-            1. Elliott Wave structure
-            2. Macro trend vs micro setup alignment
-            3. Support and resistance behavior
-            4. Fibonacci / ATR / volume context as supporting evidence
-            5. Continuation vs correction logic
-            6. Entry quality (do not force trades)
+            IMPORTANT BACKEND-FIRST + AI-REVIEWER ARCHITECTURE:
+            The backend has already analyzed trend regime, built structured context,
+            generated candidate entries, applied hard validation, and selected ONE primary setup
+            in the section:
+            --- BACKEND SETUP PLANNER ---
 
-            ---> OPTIONAL GLOBAL BIAS / USER INSTRUCTION: {market_bias} <---
-            Use this only as a directional preference if Elliott structure, support/resistance, Fibonacci confluence, ATR, volume, and timeframe alignment support it.
-            Never force a trade only because of this instruction. If the technical setup is unclear, return WAIT.
+            Your job is NOT to create a trade.
+            Your job is to REVIEW the backend-selected setup and explain it.
 
-            STRICT RULES:
-            1. Return ONLY ONE final setup in trade_scenarios.
-            2. Use OLD SCHEMA ONLY: entry_zone, targets, invalidation.
-            3. trade_type must be LONG, SHORT, or WAIT.
-            4. If setup is weak, unclear, already missed, or incomplete, return WAIT.
-            5. Do NOT return LONG or SHORT without entry_zone, exactly TWO targets, and invalidation.
-            6. entry_zone may be a single exact price OR a price range.
-                - If entry_zone is a range, the FIRST value is the actual limit entry.
-                - The first value will be used for TP/SL/RR, no-chase checks, trade status, and user display.
-                - Do NOT choose a middle value from the zone as the actual entry.
-                - Example: "77379.92 - 77800.00" means actual entry is 77379.92.
-            7. invalidation must be ONE exact price only.
-            8. targets must contain TWO prices:
-                - target 1 = exact 1.5R based on the FIRST value of entry_zone and invalidation.
-                - target 2 = STRICTLY the next "Major Support/Resistance Zone" or "Long Lookback" level provided in the Market Context.
-            9. Never use the structure target as target 1. Only target 1 is formula-based.
-            10. TP2 (Target 2) LOGIC (STRICT MARKET STRUCTURE ALIGNMENT):
-                - For LONG setups: TP2 MUST be the exact price of the "Major Resistance Zone" or "Long Lookback Major Resistance Zone". Do not invent arbitrary prices.
-                - For SHORT setups: TP2 MUST be the exact price of the "Major Support Zone" or "Long Lookback Major Support Zone". Do not invent arbitrary prices.
-                - If the required Major Zone is too close to the entry (e.g., Risk/Reward for TP2 is less than 2.0R), the setup is trapped. You MUST return WAIT.
-            11. Elliott Wave structure is the PRIMARY model. Market Structure / Fib / ATR / Volume Context is supporting evidence only.
-            12. Do not create a trade only because market context shows support/resistance or Fibonacci levels.
-            13. Use market context only to confirm, reject, or refine Elliott-based setups.
-            14. Re-check whether the correction is complete or still ongoing before giving direction.
-            15. If macro trend strongly conflicts with the setup, lower confidence or return WAIT.
-            16. Entry must be realistic relative to CURRENT PRICE.
-            17. If LONG entry_zone is below CURRENT PRICE, treat it as a limit pullback entry and action_advice must include the exact entry price, e.g. "Wait for pullback to 77750."
-            18. If SHORT entry_zone is above CURRENT PRICE, treat it as a limit bounce entry and action_advice must include the exact entry price, e.g. "Wait for bounce to 78500."
-            19. If CURRENT PRICE is closer to target 1 than to entry_zone, or price has already moved more than 50% from entry_zone toward target 1, return WAIT with action_advice = "No chase. Wait for new setup."
-            20. STOP LOSS / STRUCTURAL INVALIDATION RULE (SMART S/R PLACEMENT):
-                - Never set stop loss from ATR alone. It MUST be protected by a major structure or zone.
-                - For LONG setups: 
-                    Find the "Major Support Zone" or "Long Lookback Major Support Zone". Your SL MUST be placed strictly BELOW the BOTTOM price of this zone. Do NOT just place it below the nearest minor swing. 
-                    Also, ensure it is below the "Confirm TF Swing Low" if provided in the Critical Direction Rules.
-                - For SHORT setups: 
-                    Find the "Major Resistance Zone" or "Long Lookback Major Resistance Zone". Your SL MUST be placed strictly ABOVE the TOP price of this zone. Do NOT just place it above the nearest minor swing.
-                    Also, ensure it is above the "Confirm TF Swing High" if provided in the Critical Direction Rules.
-                - Finally, add a 1.0x to 1.5x ATR buffer beyond this chosen level to prevent Liquidity Sweeps.
-                - If placing the SL this far away makes the Risk/Reward unacceptable (e.g., Target 1 is closer than the SL distance), you MUST return WAIT. Do not artificially tighten the SL just to force a trade.
-            21. If a LONG setup targets directly into nearby major resistance and higher timeframe bias is bearish, prefer WAIT or a SHORT bounce setup.
-            22. If 1h/4h bias strongly conflicts with the 15m setup, do not take a countertrend setup unless reversal confirmation is clear.
-            23. Keep action_advice short and beginner friendly. Summary must clearly explain entry, SL, TP1, and TP2 logic.
-            24. For 15m or 30m setups, use the 1H confirmation layer as the immediate trend filter.
-            25. If 15m entry direction conflicts with 1H structure, lower confidence or return WAIT.
-            26. If 15m setup aligns with 1H and 4H structure, confidence can improve.
-            27. Do not create a trade from 1H alone; 1H is confirmation, not the entry trigger.
-            28. The requested timeframe is the entry trigger timeframe. Confirmation timeframes cannot generate a trade alone.
-            29. For 15m/30m setups, 1H confirmation can confirm, reject, or downgrade the setup, but the actual entry must still come from 15m/30m micro structure.
-            30. If 1H looks directional but the requested timeframe entry is unclear, late, or unsupported by current market context, return WAIT.
-            31. FIBONACCI CONFLUENCE (THE HOLY TRINITY):
-                - Elliott Waves structure is the primary model. However, you MUST look for "Confluence" (overlap) between the Fibonacci Pullback Zones (0.382, 0.5, 0.618, 0.786) and the Major Support/Resistance Zones.
-                - If the planned Entry Zone aligns with a printed Fibonacci level AND a Major S/R Zone, increase confidence and explain this "Holy Trinity Confluence" in the summary.
-            32. FIBONACCI PULLBACK LOGIC:
-                - For Shallow Pullbacks (Fast Markets): Look for entries near the 0.382 or 0.5 Fib levels IF volume is strong.
-                - For Deep Pullbacks (Normal/Slow Markets): Strictly wait for the 0.618 Golden Pocket or 0.786 Fib levels for entries. Do NOT chase early entries.
-            33. FIBONACCI EXTENSIONS FOR TP:
-                - Target 1 (TP1) is always the safe 1.5R exit (Formula-based).
-                - Target 2 (TP2) MUST be selected based on Major Support/Resistance. However, if there is no clear nearby S/R, use the "Continuation Extension Levels" (1.0, 1.272, 1.618) as the final target.
-            34. FIBONACCI AS SUPPORTING EVIDENCE ONLY:
-                - Do not claim an entry is at a Fibonacci level unless the entry_zone is actually close to one of the printed Fibonacci zones from the data block.
-                - If Elliott Fib Context Status is STALE or WEAK, ignore it and prioritize the "Visible Swing" Fibonacci context.
-            35. PURE PRICE ACTION ENTRIES (NO VOLUME DEPENDENCY):
-                - Do NOT use volume to filter out, delay, or reject new entries. 
-                - If the planned entry aligns with a Major Support/Resistance Zone and a printed Fibonacci level (like the 0.618 Golden Pocket), treat it as a valid Limit Order setup.
-                - Your action_advice should directly instruct the user to place a limit order at the chosen entry zone.
-            36. LIMIT ORDER CONFIRMATION RULE (SNIPER ENTRIES):
-                - A support/resistance zone touch is valid for an entry if confluence exists.
-                - You do NOT need to wait for a "rejection candle" or wick to form if the setup has good Confluence (e.g., S/R + Fibonacci). 
-                - Limit orders are placed in advance. If the Elliott structure and S/R context are valid, return the LONG/SHORT setup directly.
-                - You may remind the user to "monitor the zone" in the advice, but do NOT return WAIT just because a price rejection hasn't happened yet.
-            37. DOMINANT TREND PRIORITY RULE:
-                - Use the DOMINANT TREND CONTEXT as the main direction filter.
-                - For 15m/30m setups, 1H and 4H structure override minor 15m EMA/swing breakouts.
-                - If Dominant Direction is BEARISH or Preferred Trade Side is SHORT, prefer SHORT corrective pullback setups.
-                - If Dominant Direction is BULLISH or Preferred Trade Side is LONG, prefer LONG corrective pullback setups.
-                - If Preferred Trade Side is WAIT, do not force LONG/SHORT unless the setup is extremely clean and confirmed.
-                - Countertrend trades require confirmed reversal/rejection and cannot be High probability.
-                - Do not reverse direction from a minor 15m EMA/swing breakout unless confirmed reversal exists.
-            38. LEAD AI v2 GATEKEEPER RULE (ABSOLUTE PRIORITY):
-                - Read the "DOMINANT TREND CONTEXT (LEAD AI v2)" block carefully.
-                - If the text says "Structure Broken (CHoCH): YES", you MUST return WAIT. Do not attempt a trade.
-                - If the text says "NO LONGs below EMA200", and you find a LONG setup, you MUST override it and return WAIT.
-                - If the text says "NO SHORTs above Confirm TF Swing High", and you find a SHORT setup, you MUST override it and return WAIT.
-                - Your output trade_type CANNOT contradict the "Preferred Trade Side" provided in the Dominant Trend Context.
-            39. EXHAUSTION / DEEP PULLBACK RULE:
-                - Do NOT sell the bottom or buy the top.
-                - Do NOT use volume as a hard rejection filter for fresh trade decisions.
-                - A 0.786 deep pullback is NOT automatically a WAIT signal.
-                - If price is already extended away from the safe entry zone, or already moved more than 50% toward TP1, return WAIT / NO CHASE.
-                - If price is at or near a 0.786 deep pullback, only consider a trade if Elliott structure, support/resistance, candle rejection, and structural SL are valid.
-                - If the 0.786 area shows unclear reaction, weak structure, or no safe invalidation, return WAIT.
-                - Volume may be treated only as soft supporting context when available, never as the main reason to reject a fresh setup.
-            40. DYNAMIC TIMEFRAME RULE:
-                - When analyzing, refer to the "Confirm TF" and "Swing TF" as provided in the meta data, rather than assuming hardcoded 1H or 4H values.
-            41. GOLDEN CONFLUENCE (HIGH CONFIDENCE) TAG:
-                - Use this tag ONLY if the setup is exceptionally strong. 
-                - The entry MUST perfectly align with BOTH a "Major Support/Resistance Zone" that has a (strength 2) or (strength 3) rating, AND a printed 0.786 Deep Pullback level from the provided data.
-                - Do NOT use this tag for (strength 1) zones, and do NOT mathematically invent Fibonacci levels to force this tag.
-                - If it naturally meets this strict criteria, explicitly include this exact tag at the beginning of your 'summary': '🔥 GOLDEN SNIPER ENTRY: Major Structure + 0.786 Fib Confluence!'.
+            YOU MAY ONLY CHOOSE ONE REVIEW DECISION:
+            1. APPROVE_BACKEND_PRIMARY
+               - Use when the selected backend setup is logical, realistic, and aligned.
+            2. REJECT_TO_WAIT
+               - Use when the selected backend setup is unsafe, too early, too late, wrong-side,
+                 has unrealistic SL/TP, CHoCH conflict, range/chop conflict, or lacks real confluence.
 
+            Do NOT choose alternate candidates.
+            Do NOT output PREFER_CANDIDATE_N.
+            Candidate preferences are advisory only and must not change final entry/SL/TP.
+
+            ABSOLUTE HARD RULES:
+            1. You MUST NOT create new entry, stop loss, or target prices.
+            2. You MUST NOT modify entry_zone, targets, invalidation, trade_type, side, or order direction.
+            3. You MUST NOT choose a side blocked by backend_trend_regime.
+            4. You MUST NOT invent a trade if backend planner says WAIT / no valid setup.
+            5. If Dominant Trend says CHoCH YES or Preferred Side WAIT, strongly prefer REJECT_TO_WAIT unless the backend explicitly explains a valid exception.
+            6. If both support and resistance rejection are confirmed, treat the market as choppy/rangy and prefer WAIT unless setup is at a clean edge.
+            7. If SL is too tight, too wide, or not beyond real structure, set ai_review.decision = REJECT_TO_WAIT.
+            8. If TP2 is unrealistically far beyond nearby S/R, visible extensions, or realistic ATR range, set ai_review.decision = REJECT_TO_WAIT or mention TP/SL concern.
+            9. If a lower-timeframe setup is earlier/weaker than the 1H/HTF entry zone, prefer WAIT or a better backend candidate.
+            10. If selected setup is LIMIT_ORDER, action_advice must say wait for the exact backend entry. Do not chase.
+            11. Prefer Wave 2 / Wave ii / Wave B pullback continuation only when the backend setup and Fib/S/R context support it.
+            12. Avoid top/bottom reversal language unless backend explicitly selected a reversal.
+            13. Keep advice short, practical, and beginner-friendly.
+
+            REVIEW CHECKLIST BEFORE APPROVAL:
+            - Direction: Does selected side match HTF / trend_regime / dominant trend?
+            - Entry: Is entry at a real Fib/S/R/EMA/retest zone, not random?
+            - SL: Is SL beyond real structure and within realistic ATR/risk limits?
+            - TP2: Is TP2 reachable based on S/R, visible extensions, and ATR realism?
+            - Timing: Is current price too close to TP1 or already moved too far?
+            - Timeframe hierarchy: For 15m, does entry respect 1H/4H zone?
+
+            ELLIOTT WAVE REVIEW RULES:
+            - If BACKEND SETUP PLANNER shows "Elliott Wave: YES" or "ELLIOTT WAVE SETUP CONFIRMATION",
+              treat it as a higher-priority setup than normal EMA/Fib/S/R confluence.
+            - If an Elliott Wave template is confirmed, prefer APPROVE_BACKEND_PRIMARY unless
+              SL is clearly invalid, RR is poor, price already chased too far, or CHoCH/hard conflict exists.
+            - For Wave 2 -> Wave 3 setups, explain that the setup is trying to enter the Wave 2 pullback
+              and target the next Wave 3 continuation.
+            - For Wave 4 -> Wave 5 setups, explain that the setup is trying to enter the Wave 4 pullback
+              and target the final Wave 5 continuation.
+            - If Elliott Wave is not confirmed, say the setup is a standard backend confluence setup only.
+            - Only say "Elliott Wave: YES" if the FINAL backend-selected setup has elliott_confirmed=true or setup_source=ELLIOTT_WAVE_TEMPLATE.
+            - If an Elliott candidate appears in Candidate Debug but is rejected, you MUST say "Elliott Wave: NO".
+            - Never mark Elliott Wave YES just because Candidate Debug contains an Elliott candidate.
+            - Backend may provide Wave 3 Status as ANTICIPATION or CONFIRMED.
+            - ANTICIPATION means a valid Wave 1-2 template exists, but breakout/breakdown confirmation is not proven yet.
+            - CONFIRMED means the backend detected candle-body breakout/breakdown and momentum confirmation.
+            - If Wave 3 Status is ANTICIPATION, explain it as an early Wave 3 setup, not a fully confirmed Wave 3.
+            - If Wave 3 Status is CONFIRMED, explain it as a stronger confirmed Wave 3 continuation setup.
+            - If Planner Status is WAIT_FOR_RECLAIM, WAIT_FOR_BREAKDOWN, WAIT_FOR_RETEST_HOLD, or WAIT_FOR_RETEST_REJECTION, do NOT call it a trade signal. Return WAIT and explain the required break/retest/hold/rejection condition.
+            - If TP1 wall is very close to entry and backend still selected LIMIT_ORDER, mention it only as a caution, not a rejection.
+
+            MTF ELLIOTT CONFIRMATION RULES:
+            - Backend may provide mtf_elliott_alignment, mtf_wave_side, mtf_wave_phase, mtf_confirmation_score, and mtf_confirmation_reason.
+            - Treat these fields as backend-owned confirmation data. Do NOT invent or modify them.
+            - STRONG means the local Elliott setup aligns well with higher-timeframe Elliott wave context.
+            - MEDIUM means acceptable higher-timeframe Elliott support with normal risk control.
+            - WEAK means caution. Do not reject by yourself unless backend action is WAIT or backend candidate is already rejected.
+            - CONFLICT means the local Elliott setup conflicts with higher-timeframe Elliott structure.
+            - If mtf_elliott_alignment is CONFLICT, do NOT approve a trade. Use REJECT_TO_WAIT unless backend already returned WAIT.
+            - In micro_analysis.wave_count_status, mention MTF alignment and score when Elliott Wave is approved.
+            - In action_advice, if Elliott Wave is YES, include MTF status briefly, for example: "MTF: STRONG (82)".
+            - Never mark MTF as STRONG/MEDIUM unless backend context explicitly says so.
+
+            VERY IMPORTANT:
+            Backend will ignore any invented levels. If you output fake levels, they will be rejected.
+            If you approve, copy backend-selected setup values exactly from BACKEND SETUP PLANNER.
+            If you reject, return a WAIT scenario and explain the reason briefly.
 
             OUTPUT JSON ONLY:
             {{
                 "macro_analysis": {{
-                    "trend": "Bullish/Bearish/Sideways",
-                    "detailed_breakdown": "Explain the larger structure seen in macro data and detected waves.",
-                    "key_levels": "Key support and resistance levels from macro structure."
+                    "trend": "Bullish/Bearish/Sideways based on backend trend regime and dominant trend context",
+                    "detailed_breakdown": "Brief explanation of the larger trend and whether the backend side is safe.",
+                    "key_levels": "Mention only important support/resistance/Fib/EMA levels already present in the context."
                 }},
                 "micro_analysis": {{
-                    "wave_count_status": "Current sub-wave count based on micro structure.",
-                    "wave_personality": "Impulsive/Corrective/Unclear"
+                    "wave_count_status": "If backend confirms Elliott, mention the exact Wave template, Wave 3 Status, and MTF Elliott alignment/score if available, e.g. 'Wave 2 -> Wave 3 ANTICIPATION | MTF MEDIUM 74' or 'Wave 2 -> Wave 3 CONFIRMED | MTF STRONG 88'. If backend rejected the Elliott candidate, say the Elliott idea exists but is not an approved trade. Otherwise explain the immediate pullback, continuation, range, or unclear phase.",
+                    "wave_personality": "Impulsive/Corrective/Range/Unclear"
                 }},
-                "action_advice": "Simple, short, beginner-friendly advice.",
+                "ai_review": {{
+                    "decision": "APPROVE_BACKEND_PRIMARY or REJECT_TO_WAIT",
+                    "preferred_candidate_rank": null,
+                    "reason": "One concise reason for the review decision.",
+                    "risk_notes": "Comment on SL realism. Mention if SL is valid/too tight/too wide.",
+                    "tp_sl_notes": "Comment on TP2 realism and whether target respects structure.",
+                    "is_safe_to_show": true
+                }},
+                "action_advice": "Short beginner-friendly advice. Start with 'Elliott Wave: YES' only if the FINAL backend-selected setup has elliott_confirmed=true or setup_source=ELLIOTT_WAVE_TEMPLATE. Also mention Wave 3 Status and MTF alignment/score if available, e.g. 'MTF: STRONG (82)' or 'MTF: MEDIUM (74)'. If LIMIT_ORDER, include the exact backend entry price. If Planner Status is WAIT_FOR_RECLAIM/WAIT_FOR_BREAKDOWN/WAIT_FOR_RETEST_HOLD/WAIT_FOR_RETEST_REJECTION or backend rejected the setup, start with 'Elliott Wave: NO' and say WAIT with the backend reason.",
                 "trade_scenarios": [
                     {{
                         "name": "Sniper Setup",
-                        "trade_type": "LONG/SHORT/WAIT",
-                        "probability": "High/Medium/Low",
-                        "summary": "High-quality sniper setup aligned with macro and micro structure. TP1 is the safer 1.5R exit, while TP2 is the structure-based final target.",
-                        "entry_zone": "SPECIFIC_PRICE_OR_RANGE_FIRST_VALUE_IS_ENTRY",
-                        "targets": ["FIRST_TARGET_PRICE", "SECOND_TARGET_PRICE"],
-                        "invalidation": "STOP_LOSS_PRICE"
+                        "trade_type": "COPY_BACKEND_TRADE_TYPE_EXACTLY_OR_WAIT_IF_REJECTED",
+                        "probability": "COPY_OR_MATCH_BACKEND_PROBABILITY",
+                        "summary": "Explain/review the backend-selected setup only. Do not create new levels.",
+                        "entry_zone": "COPY_BACKEND_ENTRY_EXACTLY_OR_EMPTY_IF_WAIT",
+                        "targets": ["COPY_BACKEND_TP1_EXACTLY", "COPY_BACKEND_TP2_EXACTLY"],
+                        "invalidation": "COPY_BACKEND_STOP_EXACTLY_OR_EMPTY_IF_WAIT"
                     }}
                 ]
             }}
             """
 
-        try:
-            with open("debug_ai_prompt.txt", "w", encoding="utf-8") as f:
-                f.write(prompt)
-            print("✅ AI prompt saved to debug_ai_prompt.txt")
-        except Exception as e:
-            print(f"Prompt debug save failed: {e}")
+        # try:
+        #     with open("debug_ai_prompt.txt", "w", encoding="utf-8") as f:
+        #         f.write(prompt)
+        #     print("✅ AI prompt saved to debug_ai_prompt.txt")
+        # except Exception as e:
+        #     print(f"Prompt debug save failed: {e}")
 
         raw_text = generate_content_smart(selected_model, prompt)
 
-        try:
-            with open("debug_ai_raw_response.txt", "w", encoding="utf-8") as f:
-                f.write(raw_text)
-        except Exception as e:
-            print(f"Raw AI debug save failed: {e}")
+        # try:
+        #     with open("debug_ai_raw_response.txt", "w", encoding="utf-8") as f:
+        #         f.write(raw_text)
+        # except Exception as e:
+        #     print(f"Raw AI debug save failed: {e}")
 
 
         if '{"error"' in raw_text:
@@ -988,23 +2686,22 @@ def generate_mtf_analysis(
             json_str = match.group(0)
             try:
                 data = json.loads(json_str)
-                data = _normalize_ai_output(data)
-
                 if not locked_scenario:
-                    data = enforce_risk_reward(data, ratio=8.0)
+                    # Backend setup_planner remains the source of truth
+                    # only for this legacy reviewer flow.
+                    pass
 
-                    data = enforce_backend_quality_score(
-                        data,
-                        user_tf=user_tf,
-                        market_context_text=market_context_text,
-                        macro_structure_text=macro_structure_text,
-                        swing_structure_text=swing_structure_text,
-                        confirm_1h_structure_text=confirm_1h_structure_text,
-                        micro_structure_text=micro_structure_text
-                    )
+                data = _normalize_ai_output(
+                    data
+                )
 
-                data = _normalize_ai_output(data)
-                return json.dumps(data)
+                data = _normalize_ai_review(
+                    data
+                )
+
+                return json.dumps(
+                    data
+                )
             except Exception as e:
                 print(f"JSON Parsing/Adjustment Error: {e}")
                 return json.dumps({

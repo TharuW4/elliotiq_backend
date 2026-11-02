@@ -91,7 +91,10 @@ def _evaluate_elliott_bias(waves: List[Dict[str, Any]]) -> str:
         if any(x in combined for x in ["bullish", "up", "long"]):
             return BULLISH
 
-        if "impulse" in combined:
+        if "bearishimpulse" in combined or "bearish impulse" in combined:
+            return BEARISH
+
+        if "impulse" in combined and "bearish" not in combined:
             return BULLISH
 
         return NEUTRAL
@@ -162,15 +165,42 @@ def build_dominant_trend_context(
         preferred_side = "WAIT"
         is_broken = False
         
-        if ema_bias == BULLISH and (struct_confirm["bias"] == BULLISH or struct_swing["bias"] == BULLISH):
-            preferred_side = "LONG"
+        trend_conflict = False
+        conflict_reason = ""
+
+        confirm_struct = struct_confirm["bias"]
+        swing_struct = struct_swing["bias"]
+
+        if confirm_struct == BULLISH and swing_struct == BEARISH:
+            trend_conflict = True
+            conflict_reason = "Confirm TF is bullish but Swing TF is bearish."
+
+        elif confirm_struct == BEARISH and swing_struct == BULLISH:
+            trend_conflict = True
+            conflict_reason = "Confirm TF is bearish but Swing TF is bullish."
+
+        if trend_conflict:
+            preferred_side = "WAIT"
+
+        elif ema_bias == BULLISH:
+            # Conservative LONG rule:
+            # confirm must not be bearish, and swing must not be bearish.
+            if confirm_struct in [BULLISH, MIXED] and swing_struct in [BULLISH, MIXED, UNKNOWN]:
+                preferred_side = "LONG"
+
             if struct_confirm["last_low"] and curr_price < struct_confirm["last_low"]:
                 is_broken, preferred_side = True, "WAIT"
+                conflict_reason = "Price broke below Confirm TF last swing low."
 
-        elif ema_bias == BEARISH and (struct_confirm["bias"] == BEARISH or struct_swing["bias"] == BEARISH):
-            preferred_side = "SHORT"
+        elif ema_bias == BEARISH:
+            # Conservative SHORT rule:
+            # confirm must not be bullish, and swing must not be bullish.
+            if confirm_struct in [BEARISH, MIXED] and swing_struct in [BEARISH, MIXED, UNKNOWN]:
+                preferred_side = "SHORT"
+
             if struct_confirm["last_high"] and curr_price > struct_confirm["last_high"]:
                 is_broken, preferred_side = True, "WAIT"
+                conflict_reason = "Price broke above Confirm TF last swing high."
 
         # --- 2. ADVANCED SCORING SYSTEM (The "Brain" / Identity of the bot) ---
         swing_waves = kwargs.get("swing_waves", [])
@@ -196,6 +226,13 @@ def build_dominant_trend_context(
         
         if ew_swing_bias == BULLISH: score += 5
         elif ew_swing_bias == BEARISH: score -= 5
+
+        # Conflict penalty: do not show high confidence when HTF structures disagree.
+        if trend_conflict:
+            if score > 50:
+                score = min(score, 50)
+            elif score < 50:
+                score = max(score, 50)
         
         # Clamp score between 0 and 100
         score = max(0, min(100, score))
@@ -211,7 +248,7 @@ def build_dominant_trend_context(
         elif preferred_side == "SHORT":
             dominant_direction = BEARISH
         else:
-            dominant_direction = struct_confirm["bias"]
+            dominant_direction = MIXED if trend_conflict else struct_confirm["bias"]
 
         # --- 3. TEXT BUILDER ---
         lines = [
@@ -224,13 +261,23 @@ def build_dominant_trend_context(
             f"Confirm TF EMA200 Value: {_format_price(ema200_confirm)}",
             f"Current Price: {_format_price(curr_price)}",
             f"Structure Broken (CHoCH): {'YES' if is_broken else 'NO'}",
+            f"CHoCH Status: {'CONFIRM_TF_BREAK' if is_broken else 'CHOCH_NONE'}",
+            f"CHoCH Severity: {'STRONG' if is_broken else 'NONE'}",
+            f"CHoCH Direction: {'BEARISH' if preferred_side != 'SHORT' and is_broken else ('BULLISH' if preferred_side != 'LONG' and is_broken else 'NONE')}",
+            f"Trend Conflict: {'YES' if trend_conflict else 'NO'}",
+            f"HTF Alignment: {'CONFLICT' if trend_conflict else 'ALIGNED_OR_NEUTRAL'}",
+            f"Trend Transition State: {'CONFIRM_SWING_CONFLICT' if trend_conflict else ('REVERSAL_FORMING' if is_broken else 'TREND_OR_PULLBACK')}",
+            f"Recommended Trade Mode: {'WAIT' if is_broken else ('CONFIRMATION_REQUIRED' if trend_conflict else 'FULL_TRADE')}",
+            f"Conflict Reason: {conflict_reason if conflict_reason else 'None'}",
             "",
             "CRITICAL DIRECTION RULES:",
             "- NO LONGs below Confirm TF EMA200 unless strong reclaim/retest confirmation exists.",
             "- NO SHORTs above Confirm TF EMA200 unless strong rejection/breakdown confirmation exists.",
             "- NO LONGs if price breaks below Confirm TF last swing low.",
             "- NO SHORTs if price breaks above Confirm TF last swing high.",
-            "- If CHoCH is YES, AI MUST return WAIT.",
+            "- If CHoCH Severity is STRONG, AI MUST return WAIT or require retest confirmation.",
+            "- If Confirm TF and Swing TF conflict strongly, AI MUST NOT approve full trade immediately.",
+            "- If local movement is against HTF direction, treat it as pullback until reclaim/retest confirms reversal.",
             f"- Swing TF Structure is currently {struct_swing['bias']}.",
             "",
             "--- ADVANCED SCORING & CONFLUENCE ---",

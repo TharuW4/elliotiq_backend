@@ -516,6 +516,9 @@ def build_recent_candle_rejection_flags(
         "support_zone_state": "UNKNOWN",
         "resistance_zone_state": "UNKNOWN",
 
+        "both_rejections": False,
+        "no_rejection": True,
+
         "margin": 0,
         "notes": []
     }
@@ -553,12 +556,12 @@ def build_recent_candle_rejection_flags(
 
         support_zone = _get_first_zone_bounds(
             market_context_text,
-            ["Major Support Zone", "Nearest Support", "Long Lookback Major Support Zone"]
+            ["Major Support Zone", "Long Lookback Major Support Zone", "Nearest Support"]
         )
 
         resistance_zone = _get_first_zone_bounds(
             market_context_text,
-            ["Major Resistance Zone", "Nearest Resistance", "Long Lookback Major Resistance Zone"]
+            ["Major Resistance Zone", "Long Lookback Major Resistance Zone", "Nearest Resistance"]
         )
 
         metrics = _candle_metrics(closed_ohlc)
@@ -646,6 +649,9 @@ def build_recent_candle_rejection_flags(
             "support_zone_state": support_state,
             "resistance_zone_state": resistance_state,
 
+            "both_rejections": bool(support_rejection and resistance_rejection),
+            "no_rejection": bool(not support_rejection and not resistance_rejection),
+
             "margin": margin,
             "notes": notes
         })
@@ -704,6 +710,8 @@ Support Zone State: {flags.get("support_zone_state")}
 Resistance Zone State: {flags.get("resistance_zone_state")}
 Support Rejection Confirmed: {_yes_no(flags.get("support_rejection_confirmed"))}
 Resistance Rejection Confirmed: {_yes_no(flags.get("resistance_rejection_confirmed"))}
+Both Rejections Confirmed: {_yes_no(flags.get("both_rejections"))}
+No Rejection Confirmed: {_yes_no(flags.get("no_rejection"))}
 Zone Check Margin: {_format_price(flags.get("margin"))}
 Rejection Notes: {notes_text}
 """

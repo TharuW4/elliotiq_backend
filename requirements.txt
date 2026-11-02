@@ -5,7 +5,7 @@ numpy
 numba
 ccxt
 yfinance
-google-genai
+google-genai>=2.3.0,<3.0.0
 firebase-admin
 requests
 scipy
@@ -14,4 +14,7 @@ streamlit
 fpdf
 python-dotenv
 pandas-ta
+smartmoneyconcepts==0.0.27
 google-generativeai
+gunicorn
+google-auth

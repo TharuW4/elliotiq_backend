@@ -75,7 +75,7 @@ class Impulse(WaveRule):
             # WAVE 4
             "w4_1": {
                 "waves": ["wave1", "wave4"],
-                "function": lambda wave1, wave4: wave4.low > wave1.high - atr_buffer,
+                "function": lambda wave1, wave4: wave4.low > wave1.high,
                 "message": "End of Wave4 is lower than End of Wave1",
             },
             "w4_2": {
@@ -111,8 +111,9 @@ class Correction(WaveRule):
         conditions = {  # WAVE B
             "w2_1": {
                 "waves": ["wave1", "wave2"],
-                "function": lambda waveA, waveB: waveA.high > waveB.high,
-                "message": "End of WaveB is higher than Start of WaveA.",
+                # Expanded Flat: Wave B can exceed Wave A start by 0.382 of Wave A length.
+                "function": lambda waveA, waveB: waveB.high <= waveA.high + (waveA.length * 0.382),
+                "message": "End of WaveB went too far above Start of WaveA (> 1.382 Expanded Flat).",
             },
             "w2_2": {
                 "waves": ["wave1", "wave3"],
@@ -121,8 +122,9 @@ class Correction(WaveRule):
             },
             "w2_3": {
                 "waves": ["wave1", "wave2"],
-                "function": lambda waveA, waveB: waveA.length > waveB.length,
-                "message": "WaveB longer than WaveA.",
+                # FIXED: Aligned with Expanded Flat rule. Wave B can be up to 1.382x the length of Wave A.
+                "function": lambda waveA, waveB: waveB.length <= (waveA.length * 1.382),
+                "message": "WaveB is strictly longer than 1.382x WaveA (Violates Expanded Flat length limit).",
             },
             "w2_4": {
                 "waves": ["wave1", "wave2"],
@@ -139,15 +141,62 @@ class Correction(WaveRule):
                 "function": lambda waveA, waveC: waveC.length < 2.61 * waveA.length,
                 "message": "WaveB longer (value wise) than 2.61 x WaveA.",
             },
-            "w2_7": {
-                "waves": ["wave1", "wave2"],
-                "function": lambda waveA, waveB: waveB.length < 0.618 * waveA.length,
-                "message": "WaveB longer (value wise) than 0.618 x WaveA.",
-            },
             "w3_1": {
                 "waves": ["wave1", "wave3"],
                 "function": lambda waveA, waveC: waveC.duration < 10.0 * waveA.duration,
                 "message": "WaveB longer (value wise) than 2.61 x WaveA.",
+            },
+            "w3_2": {
+                "waves": ["wave1", "wave2"],
+                "function": lambda waveA, waveB: waveB.length > 0.35 * waveA.length,
+                "message": "WaveB shorter (value wise) than 0.35 x WaveA.",
+            },
+        }
+        return conditions
+
+class BearishCorrection(WaveRule):
+    """
+    Rules for a bearish corrective wave (A=Up, B=Down, C=Up)
+    Following an Impulse Down.
+    """
+    def set_conditions(self):
+        conditions = {  # WAVE B
+            "w2_1": {
+                "waves": ["wave1", "wave2"],
+                # Wave B goes down. It can exceed Wave A's start (low), but only by 38.2% of A's length.
+                "function": lambda waveA, waveB: waveB.low >= waveA.low - (waveA.length * 0.382),
+                "message": "End of WaveB went too far below Start of WaveA (> 1.382 Expanded Flat).",
+            },
+            "w2_2": {
+                "waves": ["wave1", "wave3"],
+                # Wave C goes up. End of C should be higher than start of A (which is a low).
+                "function": lambda waveA, waveC: waveA.high < waveC.high,
+                "message": "End of WaveC is lower than Start of WaveA.",
+            },
+            "w2_3": {
+                "waves": ["wave1", "wave2"],
+                "function": lambda waveA, waveB: waveB.length <= (waveA.length * 1.382),
+                "message": "WaveB is strictly longer than 1.382x WaveA (Violates Expanded Flat length limit).",
+            },
+            "w2_4": {
+                "waves": ["wave1", "wave2"],
+                "function": lambda waveA, waveB: waveB.duration < 10.0 * waveA.duration,
+                "message": "WaveB longer (time wise) than 10 x WaveA.",
+            },
+            "w2_5": {
+                "waves": ["wave1", "wave3"],
+                "function": lambda waveA, waveC: waveC.length > 0.6 * waveA.length,
+                "message": "WaveC shorter (value wise) than 0.60 x WaveA.",
+            },
+            "w2_6": {
+                "waves": ["wave1", "wave3"],
+                "function": lambda waveA, waveC: waveC.length < 2.61 * waveA.length,
+                "message": "WaveC longer (value wise) than 2.61 x WaveA.", 
+            },
+            "w3_1": {
+                "waves": ["wave1", "wave3"],
+                "function": lambda waveA, waveC: waveC.duration < 10.0 * waveA.duration,
+                "message": "WaveC longer (time wise) than 10 x WaveA.", 
             },
             "w3_2": {
                 "waves": ["wave1", "wave2"],

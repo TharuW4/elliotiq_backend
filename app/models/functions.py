@@ -3,14 +3,7 @@ import numpy as np
 
 @njit
 def hi(lows_arr: np.array, highs_arr: np.array, idx_start: int = 0):
-    """
-    Given idx_start (and a previous high), this returns the next high, high_idx
-
-    :param idx_start:
-    :param prev_high:
-    :return:
-    """
-    high = lows_arr[idx_start]
+    high = highs_arr[idx_start]  # FIX: Used highs_arr
     high_idx = idx_start
 
     for idx in range(idx_start + 1, len(highs_arr)):
@@ -25,15 +18,7 @@ def hi(lows_arr: np.array, highs_arr: np.array, idx_start: int = 0):
 
 @njit
 def next_hi(lows_arr: np.array, highs_arr: np.array, idx_start: int = 0, prev_high: float = 0):
-    """
-    Given idx_start (and a previous high), this returns the next high, high_idx
-
-    :param idx_start:
-    :param prev_high:
-    :return:
-    """
-
-    high = lows_arr[idx_start]
+    high = highs_arr[idx_start]  # FIX: Used highs_arr
     high_idx = None
 
     prev_high_reached = False
@@ -60,7 +45,8 @@ def next_hi(lows_arr: np.array, highs_arr: np.array, idx_start: int = 0, prev_hi
 
 @njit
 def next_lo(lows_arr: np.array, highs_arr: np.array, idx_start: int, prev_low: float):
-    low = highs_arr[idx_start]
+    low = lows_arr[idx_start]  # FIX: Used lows_arr
+    low_idx = idx_start # FIX: Added missing initialization
     prev_low_reached = False
 
     for idx in range(idx_start + 1, len(lows_arr)):
@@ -87,7 +73,7 @@ def next_lo(lows_arr: np.array, highs_arr: np.array, idx_start: int, prev_low: f
 @njit
 def lo(lows_arr: np.array, highs_arr: np.array, idx_start):
     low_idx = idx_start
-    low = highs_arr[idx_start]
+    low = lows_arr[idx_start]  # FIX: Used lows_arr
 
     for idx in range(idx_start + 1, len(lows_arr)):
         act_low = lows_arr[idx]

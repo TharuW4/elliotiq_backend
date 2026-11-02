@@ -2,7 +2,7 @@ from .MonoWave import MonoWaveUp, MonoWaveDown
 from .WaveOptions import WaveOptionsGenerator5, WaveOptionsGenerator3
 from .WaveCycle import WaveCycle
 from .WavePattern import WavePattern
-from .WaveRules import Impulse, Correction, TDWave
+from .WaveRules import Impulse, Correction, TDWave, BearishCorrection
 import numpy as np
 import pandas as pd
 
@@ -132,6 +132,17 @@ class WaveAnalyzer:
             if self.verbose: print('Low of Wave 4 higher than a low between Wave 4 and Wave 5')
             return False
 
+        # --- NEW: Wave 3 Extension Check (Bullish) ---
+        try:
+            len1 = abs(float(wave1.high) - float(wave1.low))
+            len3 = abs(float(wave3.high) - float(wave3.low))
+            if len3 > (len1 * 1.618):
+                setattr(wave3, 'is_extended', True) 
+            else:
+                setattr(wave3, 'is_extended', False)
+        except Exception:
+            setattr(wave3, 'is_extended', False)
+
         return [wave1, wave2, wave3, wave4, wave5]
 
     # ==========================================================
@@ -182,10 +193,11 @@ class WaveAnalyzer:
 
             # Wave 5 should continue below Wave 3 low.
             # This rejects truncated fifth waves for safety.
-            if float(wave5.low) >= float(wave3.low):
-                if self.verbose:
-                    print("Bearish impulse invalid: Wave 5 did not break below Wave 3 low.")
-                return False
+            # --- UPDATED: Commented out to allow Truncated Wave 5 (Reversals) ---
+            # if float(wave5.low) >= float(wave3.low):
+            #     if self.verbose:
+            #         print("Bearish impulse invalid: Wave 5 did not break below Wave 3 low.")
+            #     return False
 
             # Wave 3 should not be the shortest among waves 1, 3, 5.
             len1 = self._wave_length(wave1)
@@ -299,7 +311,6 @@ class WaveAnalyzer:
             idx_start=wave4_end,
             skip=wave_config[4]
         )
-        wave5.label = "5"
         wave5_end = wave5.idx_end
         if wave5_end is None:
             if self.verbose:
@@ -308,6 +319,17 @@ class WaveAnalyzer:
 
         if not self._is_bearish_impulse_structurally_valid(wave1, wave2, wave3, wave4, wave5):
             return False
+
+        # --- NEW: Wave 3 Extension Check (Bearish) ---
+        try:
+            len1 = abs(float(wave1.low) - float(wave1.high))
+            len3 = abs(float(wave3.low) - float(wave3.high))
+            if len3 > (len1 * 1.618):
+                setattr(wave3, 'is_extended', True)
+            else:
+                setattr(wave3, 'is_extended', False)
+        except Exception:
+            setattr(wave3, 'is_extended', False)
 
         return [wave1, wave2, wave3, wave4, wave5]
 
@@ -338,6 +360,36 @@ class WaveAnalyzer:
             return False
 
         waveC = MonoWaveDown(lows=self.lows, highs=self.highs, dates=self.dates, idx_start=waveB_end, skip=wave_config[2])
+        waveC.label = 'C'
+        waveC_end = waveC.idx_end
+        if waveC_end is None:
+            return False
+
+        return [waveA, waveB, waveC]
+
+    def find_corrective_wave_up(self,
+                             idx_start: int,
+                             wave_config: list = None):
+        """
+        Tries to find a bearish corrective movement (A=Up, B=Down, C=Up)
+        after a bearish impulse.
+        """
+        if wave_config is None:
+            wave_config = [0, 0, 0]
+
+        waveA = MonoWaveUp(lows=self.lows, highs=self.highs, dates=self.dates, idx_start=idx_start, skip=wave_config[0])
+        waveA.label = 'A'
+        waveA_end = waveA.idx_end
+        if waveA_end is None:
+            return False
+
+        waveB = MonoWaveDown(lows=self.lows, highs=self.highs, dates=self.dates, idx_start=waveA_end, skip=wave_config[1])
+        waveB.label = 'B'
+        waveB_end = waveB.idx_end
+        if waveB_end is None:
+            return False
+
+        waveC = MonoWaveUp(lows=self.lows, highs=self.highs, dates=self.dates, idx_start=waveB_end, skip=wave_config[2])
         waveC.label = 'C'
         waveC_end = waveC.idx_end
         if waveC_end is None:
@@ -385,24 +437,23 @@ class WaveAnalyzer:
 
         return [wave1, wave2]
 
-    def next_cycle(self,
-                   start_idx: int):
+    def next_cycle(self, start_idx: int):
 
         impulse = Impulse('impulse')
         correction = Correction('correction')
+        bearish_correction = BearishCorrection('bearish_correction')
 
         wave_cycles = set()
 
+        # --- 1. BULLISH CYCLES (Impulse UP -> Correction DOWN) ---
         for new_option_impulse in self.__waveoptions_up.options_sorted:
-
             cycle_complete = False
-            waves_up = self.find_impulsive_wave(idx_start=start_idx,
-                                                wave_config=new_option_impulse.values)
+            waves_up = self.find_impulsive_wave(idx_start=start_idx, wave_config=new_option_impulse.values)
 
             if waves_up:
                 wavepattern_up = WavePattern(waves_up, verbose=False)
                 if wavepattern_up.check_rule(impulse):
-                    if self.verbose: ('Impulse found!', new_option_impulse.values)
+                    if self.verbose: print('Bullish Impulse found!', new_option_impulse.values)
                     end = waves_up[4].idx_end
 
                     for new_option_correction in self.__waveoptions_down.options_sorted:
@@ -410,15 +461,39 @@ class WaveAnalyzer:
                         if waves:
                             wavepattern = WavePattern(waves, verbose=False)
                             if wavepattern.check_rule(correction):
-
                                 cycle_complete = True
                                 wave_cycle = WaveCycle(wavepattern_up, wavepattern)
                                 wave_cycles.add(wave_cycle)
 
-                                # if wave_cycle not in wave_cycles:
                                 if self.verbose and wave_cycle not in wave_cycles:
-                                    print('Corrrection found!', new_option_correction.values)
-                                    print('*' * 40)
+                                    print('Bullish Correction found!', new_option_correction.values)
+
+                    if cycle_complete:
+                        yield wave_cycle
+
+        # --- 2. BEARISH CYCLES (Impulse DOWN -> Correction UP) ---
+        # FIXED: Bearish impulse needs 5 waves, so use __waveoptions_up
+        for new_option_impulse in self.__waveoptions_up.options_sorted:
+            cycle_complete = False
+            waves_down = self.find_impulsive_wave_down(idx_start=start_idx, wave_config=new_option_impulse.values)
+
+            if waves_down:
+                wavepattern_down = WavePattern(waves_down, verbose=False)
+                if self.verbose: print('Bearish Impulse found!', new_option_impulse.values)
+                end = waves_down[4].idx_end
+
+                # FIXED: Bearish correction needs 3 waves, so use __waveoptions_down
+                for new_option_correction in self.__waveoptions_down.options_sorted:
+                    waves = self.find_corrective_wave_up(idx_start=end, wave_config=new_option_correction.values)
+                    if waves:
+                        wavepattern = WavePattern(waves, verbose=False)
+                        if wavepattern.check_rule(bearish_correction): 
+                            cycle_complete = True
+                            wave_cycle = WaveCycle(wavepattern_down, wavepattern)
+                            wave_cycles.add(wave_cycle)
+
+                            if self.verbose and wave_cycle not in wave_cycles:
+                                print('Bearish Correction found!', new_option_correction.values)
 
                     if cycle_complete:
                         yield wave_cycle
